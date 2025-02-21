@@ -1,0 +1,2374 @@
+---
+title: "TST11724: Identifying expression of sense and antisense transcripts across AAV genome"
+author: "Soumya Negi, Genome Informatics"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    code_folding: hide
+    collapsed: no
+    highlight: haddock
+    theme: journal
+    toc: yes
+    toc_float:
+      collapsed: no
+    fig_width: 9
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T,  message=FALSE, warning=FALSE, cache=FALSE)
+library(future)
+library(ggplot2)
+library(cowplot)
+library(dplyr)
+library(RColorBrewer)
+library(tidyr)
+library(biomaRt)
+library(data.table)
+library(tidyverse)
+library(ComplexHeatmap)
+```
+
+# Background
+
+This analysis looks at the datasets from TST11580, where NHP datasets were profiled using bulk RNAseq (total RNA kit) after being injected with AAV-amiR-SOD1. Here are some salient points about the project:
+
+* TST11580 is a large scale project performed on NHPs supporting the AAV-amiR-SOD1 program. 
+* One duplex a-miR candidate (V76), one singlet a-miR (V79) GLP vectors and a negative control (artificial cerebrospinal fluid) were administered in a single bolus injection via ICM at 2 doses. 
+* Total RNA  was extracted from cortex, spinal cord, DRGs, brainstem, and liver tissues at 6 weeks post injection. 
+* Maria Zavodszky analyzed these samples and showed on average moderate knockdown of SOD1 with some variations across different tissues. Additionally she did  (Analysis link: http://go/1t)
+* DRG tox was seen in these animals. Pathological quantification results are pending.
+
+## Need for current analysis
+Hypothesis: Upregulation of dsRNA-sensing pathway in DRGs could play an important role in DRG Tox. ITR bidirectional promoter activity maybe the cause of dsRNA generation, specifically 3’ ITR.
+
+## Objectives:
+
+1. Can we detect (-) strand cargo RNA in TST11580?
+2. Are there any differences in (-) strand cargo expression across different tissues, specifically are they enriched in the DRGs?
+3. Is the (-) strand cargo RNA expression dose-dependent?
+
+
+
+# Loading datasets
+
+Calculating TPM levels from the featureCounts result.
+```{r}
+samplesheet <- read.table("/camhpc/ngs/projects/TST11724/scripts/sample_groups.txt", header = T, sep = "\t")
+samplesheet$SampleName.orig <- as.character(samplesheet$SampleName.orig)
+V79.samples <- samplesheet$SampleName.orig[samplesheet$Vector %in% c("aCSF","V79")]
+rownames(samplesheet) <- samplesheet$SampleName.orig
+
+if(!file.exists("/camhpc/ngs/projects/TST11724/scripts/data/DNANexus_20210317213939_NHP_V79_tpm.rds")){
+  path <- file.path("/camhpc/ngs/projects/TST11724/counts_mRNAseq/DNANexus_20210317213939_2/",V79.samples,".mRNA.V79_AAV-amiR-SOD1.counts.txt", fsep = "")
+
+  all.files <- lapply(path, function(x) read.delim(x, header = T, comment.char = "#"))
+  temp <- lapply(all.files, function(x) x[7])
+  counts <- do.call(cbind,temp)
+  colnames(counts) <- V79.samples
+  rm(temp)
+  
+  gene.desc <- as.data.frame(all.files[1])[,1:6]
+  rownames(counts) <- gene.desc$Geneid
+  gene.desc$LengthKB <- gene.desc$Length/1000
+  rpk <- apply(counts,2,function(x) x/gene.desc$LengthKB)
+  scaling.factor <- colSums(counts)/10^6
+  tpm <- apply(rpk,2,function(x) x/scaling.factor)
+  saveRDS(tpm,file = "/camhpc/ngs/projects/TST11724/scripts/data/DNANexus_20210317213939_NHP_V79_tpm.rds")
+  saveRDS(counts, file = "/camhpc/ngs/projects/TST11724/scripts/data/DNANexus_20210317213939_NHP_V79_counts.rds")
+  saveRDS(gene.desc, file = "/camhpc/ngs/projects/TST11724/scripts/data/DNANexus_20210317213939_NHP_V79_gene.details.rds")
+} else {
+  tpm <- readRDS(file = "/camhpc/ngs/projects/TST11724/scripts/data/DNANexus_20210317213939_NHP_V79_tpm.rds")
+  counts <- readRDS(file = "/camhpc/ngs/projects/TST11724/scripts/data/DNANexus_20210317213939_NHP_V79_counts.rds")
+  gene.desc <- readRDS(file = "/camhpc/ngs/projects/TST11724/scripts/data/DNANexus_20210317213939_NHP_V79_gene.details.rds")
+}
+
+```
+
+# Plotting sense and antisense vector tpms
+
+Now that TPM levels are calculated, here we plot out expression of each vector annotation in separate plots. 
+```{r}
+vector <- c("5_ITR","enhancer","chicken_b_actin_promoter","intron","5_miRE-mirimus","guide_amiRSOD1","miR_30a_loop","passenger_amiRSOD1","3_miRE","WPRE","polyA_signal", "3_ITR")
+
+
+vectorTPM <- as.data.frame(tpm[c(paste0(vector, "_sense"),paste0(vector, "_antisense")),])
+temp <- rownames(vectorTPM)
+vectorTPM <- mutate_all(vectorTPM, function(x) as.numeric(as.character(x)))
+rownames(vectorTPM) <- temp
+genesTPM_t <- t(vectorTPM)
+
+vectorTPM_annot <- merge(samplesheet, genesTPM_t, by="row.names")
+vectorTPM_annot <- vectorTPM_annot[,-1]
+vectorTPM_annot$Dose <- factor(vectorTPM_annot$Dose, levels = c("0","Low","High"))
+vectorTPM_annot$TissueSub <- factor(vectorTPM_annot$TissueSub, levels = c("Bst10","Bst11","Bst12", "CtxM","DrgC","DrgT","DrgL","ScC","ScT","ScL","LvL1","LvL2","LvR1","LvR2" ))
+vectorTPM_annot$amiR_sense <- rowMeans(subset(vectorTPM_annot, select = c("5_miRE-mirimus_sense",
+                                    "guide_amiRSOD1_sense",
+                                    "miR_30a_loop_sense",
+                                    "passenger_amiRSOD1_sense",
+                                    "3_miRE_sense")), na.rm = TRUE)
+
+vectorTPM_annot$amiR_antisense <- rowMeans(subset(vectorTPM_annot, select = c("5_miRE-mirimus_antisense",
+                                    "guide_amiRSOD1_antisense",
+                                    "miR_30a_loop_antisense",
+                                    "passenger_amiRSOD1_antisense",
+                                    "3_miRE_antisense")), na.rm = TRUE)
+
+vectorTPM_annot$Enh_Prom_sense <- rowMeans(subset(vectorTPM_annot, select = c("enhancer_sense",
+                                    "chicken_b_actin_promoter_sense")), na.rm = TRUE)
+
+vectorTPM_annot$Enh_Prom_antisense <- rowMeans(subset(vectorTPM_annot, select = c("enhancer_antisense",
+                                    "chicken_b_actin_promoter_antisense")), na.rm = TRUE)
+
+vector <- c("5_ITR","enhancer","chicken_b_actin_promoter","Enh_Prom","intron","5_miRE-mirimus","guide_amiRSOD1","miR_30a_loop","passenger_amiRSOD1","3_miRE","amiR","WPRE","polyA_signal", "3_ITR")
+
+for (i in c(paste0(vector, "_sense"),paste0(vector, "_antisense"))) {
+  p <- ggplot(vectorTPM_annot, aes(x = Dose, y = vectorTPM_annot[,i])) + 
+  geom_boxplot() +
+  geom_dotplot(binaxis='y', 
+               stackdir='center', 
+               dotsize = 1,
+               fill="black") +
+  ylab("Expression (TPM)") +
+  facet_wrap(~TissueSub, ncol = 7) + ggtitle(i) +
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) 
+  print(p)
+}
+
+
+```
+
+Viewing the expression in a slightly different way:
+
+```{r, fig.height=4, fig.width=10}
+for (i in c(paste0(vector, "_sense"))) {
+  p <- ggplot(vectorTPM_annot, aes(x = TissueSub, y = vectorTPM_annot[,i], fill = Tissue)) + 
+  geom_boxplot() +
+  geom_dotplot(binaxis='y', 
+               stackdir='center', 
+               dotsize = 0.6,
+               fill="black") +
+  # geom_text(aes(label=ifelse(vectorTPM_annot[,i]>75,as.character(NHP_ID),'')),hjust=0,vjust=0) +
+  # geom_text(aes(label=ifelse(vectorTPM_annot[,i]>75,as.character(NHP_ID),'')),angle=45,hjust=0,vjust=1) +
+  # geom_label_repel(aes(label=ifelse(vectorTPM_annot[,i]>5,as.character(NHP_ID),'')),
+  #                box.padding = unit(0.35, "lines"),
+  #                point.padding = unit(0.5, "lines")) +
+  ylab("Expression (TPM)") +
+  facet_wrap(~Dose, ncol = 7) + ggtitle(i) +
+  # scale_y_sqrt() +
+  theme(axis.text.x = element_text(angle = 45, hjust=1, vjust = 1), plot.title = element_text(hjust = 0.5)) 
+  print(p)
+  ggsave(filename = paste0("/camhpc/ngs/projects/TST11724/scripts/plots/sense_antisense/boxplot/"
+                            ,i,".png"), 
+           plot = p)
+  
+}
+```
+
+```{r, fig.height=4, fig.width=10}
+for (i in c(paste0(vector, "_antisense"))) {
+  p <- ggplot(vectorTPM_annot, aes(x = TissueSub, y = vectorTPM_annot[,i], fill = Tissue)) + 
+  geom_boxplot() +
+  geom_dotplot(binaxis='y', 
+               stackdir='center', 
+               dotsize = 0.6,
+               fill="black") +
+  geom_text(aes(label=ifelse(vectorTPM_annot[,i]>10,as.character(NHP_ID),'')),angle=45,hjust=0,vjust=1) +
+  ylab("Expression (TPM)") +
+  facet_wrap(~Dose, ncol = 7) + ggtitle(i) +
+  # scale_y_sqrt() +
+  theme(axis.text.x = element_text(angle = 45, hjust=1, vjust = 1), plot.title = element_text(hjust = 0.5)) 
+  print(p)
+  ggsave(filename = paste0("/camhpc/ngs/projects/TST11724/scripts/plots/sense_antisense/boxplot/"
+                            ,i,".png"), 
+           plot = p)
+  
+}
+```
+
+# Plotting sense/antisense together
+
+```{r}
+library(reshape2)
+subset <- vectorTPM_annot[,c("SampleName.orig","Dose", "TissueSub", "Vector", "Tissue",c(paste0(vector, "_sense"),paste0(vector, "_antisense")))]
+vectorTPM_annot_long <- melt(subset, id.vars=c("SampleName.orig","Dose", "TissueSub", "Vector","Tissue"))
+colnames(vectorTPM_annot_long)[6] <- "Annotation"
+vectorTPM_annot_long$RNA_type <-  "sense"
+vectorTPM_annot_long$RNA_type[grep(pattern = "_antisense", vectorTPM_annot_long$Annotation)] <- "antisense"
+vectorTPM_annot_long$RNA_type <- factor(vectorTPM_annot_long$RNA_type, levels = c("sense","antisense"))
+vectorTPM_annot_long$Annotation <- as.character(vectorTPM_annot_long$Annotation)
+vectorTPM_annot_long$value <- as.numeric(vectorTPM_annot_long$value)
+vectorTPM_annot_long$vector_annotation <- ""
+
+vectorTPM_annot_long$vector_annotation[vectorTPM_annot_long$RNA_type %in% "antisense"] = substr(vectorTPM_annot_long$Annotation[vectorTPM_annot_long$RNA_type %in% "antisense"],1,nchar(vectorTPM_annot_long$Annotation[vectorTPM_annot_long$RNA_type %in% "antisense"])-10)
+
+vectorTPM_annot_long$vector_annotation[vectorTPM_annot_long$RNA_type %in% "sense"] = substr(vectorTPM_annot_long$Annotation[vectorTPM_annot_long$RNA_type %in% "sense"],1,nchar(vectorTPM_annot_long$Annotation[vectorTPM_annot_long$RNA_type %in% "sense"])-6)
+
+vectorTPM_annot_long$vector_annotation <- factor(vectorTPM_annot_long$vector_annotation, levels = c("5_ITR","enhancer","chicken_b_actin_promoter","Enh_Prom","intron","5_miRE-mirimus","guide_amiRSOD1","miR_30a_loop","passenger_amiRSOD1","3_miRE","amiR","WPRE","polyA_signal", "3_ITR"))
+
+vectorTPM_annot_long$Annotation <- factor(vectorTPM_annot_long$Annotation, levels = c(paste0(vector, "_sense"),paste0(vector, "_antisense")))
+
+vectorTPM_annot_long$TissueSub <- factor(vectorTPM_annot_long$TissueSub, levels = c("Bst10","Bst11","Bst12", "CtxM","DrgC","DrgT","DrgL","ScC","ScT","ScL","LvL1","LvL2","LvR1","LvR2" ))
+
+```
+
+
+```{r}
+vectorTPM_annot_long$Sample.Id <- paste0(vectorTPM_annot_long$TissueSub, ",",vectorTPM_annot_long$Dose)
+vectorTPM_annot_long$log2.tpm <- log2(vectorTPM_annot_long$value + 1)
+```
+
+```{r}
+# TPM values:
+vectorTPM_summary <- data.frame()
+for (i in c(paste0(vector, "_sense"),paste0(vector, "_antisense"))) {
+  temp <- vectorTPM_annot_long %>% 
+  filter(Annotation == i) %>%
+  group_by(Sample.Id) %>%   # the grouping variable
+  summarise(mean = mean(value),  # calculates the mean of each group
+            sd = sd(value), # calculates the standard deviation of each group
+            min = min(value),
+            max = max(value),
+            n = n(),  # calculates the sample size per group
+            SE = sd(value)/sqrt(n())) # calculates the standard error of each group
+  temp$Annotation <- i
+  vectorTPM_summary <- rbind(vectorTPM_summary,temp)
+}
+vectorTPM_summary <- vectorTPM_summary %>% separate(Sample.Id, into = c("TissueSub","Dose"), sep = ",")
+vectorTPM_summary$RNA_type <- NULL
+vectorTPM_summary$RNA_type[grepl( "antisense", vectorTPM_summary$Annotation)] <- "antisense"
+vectorTPM_summary$RNA_type[grepl( "_sense", vectorTPM_summary$Annotation)] <- "sense"
+vectorTPM_summary$RNA_type <- factor(vectorTPM_summary$RNA_type, levels = c("sense","antisense"))
+vectorTPM_summary$vector_annotation <- ""
+
+vectorTPM_summary$vector_annotation[vectorTPM_summary$RNA_type %in% "antisense"] = substr(vectorTPM_summary$Annotation[vectorTPM_summary$RNA_type %in% "antisense"],1,nchar(vectorTPM_summary$Annotation[vectorTPM_summary$RNA_type %in% "antisense"])-10)
+
+vectorTPM_summary$vector_annotation[vectorTPM_summary$RNA_type %in% "sense"] = substr(vectorTPM_summary$Annotation[vectorTPM_summary$RNA_type %in% "sense"],1,nchar(vectorTPM_summary$Annotation[vectorTPM_summary$RNA_type %in% "sense"])-6)
+
+vectorTPM_summary$Dose <- factor(vectorTPM_summary$Dose, levels = c("0","Low","High"))
+vectorTPM_summary$TissueSub <- factor(vectorTPM_summary$TissueSub, levels = c("Bst10","Bst11","Bst12", "CtxM","DrgC","DrgT","DrgL","ScC","ScT","ScL","LvL1","LvL2","LvR1","LvR2" ))
+```
+
+```{r}
+# Log2 values:
+vectorTPM_summary.log <- data.frame()
+for (i in c(paste0(vector, "_sense"),paste0(vector, "_antisense"))) {
+  temp <- vectorTPM_annot_long %>% 
+  filter(Annotation == i) %>%
+  group_by(Sample.Id) %>%   # the grouping variable
+  summarise(mean = mean(log2.tpm),  # calculates the mean of each group
+            sd = sd(log2.tpm), # calculates the standard deviation of each group
+            min = min(log2.tpm),
+            max = max(log2.tpm),
+            n = n(),  # calculates the sample size per group
+            SE = sd(log2.tpm)/sqrt(n())) # calculates the standard error of each group
+  temp$Annotation <- i
+  vectorTPM_summary.log <- rbind(vectorTPM_summary.log,temp)
+}
+vectorTPM_summary.log <- vectorTPM_summary.log %>% separate(Sample.Id, into = c("TissueSub","Dose"), sep = ",")
+vectorTPM_summary.log$RNA_type <- NULL
+vectorTPM_summary.log$RNA_type[grepl( "antisense", vectorTPM_summary.log$Annotation)] <- "antisense"
+vectorTPM_summary.log$RNA_type[grepl( "_sense", vectorTPM_summary.log$Annotation)] <- "sense"
+vectorTPM_summary.log$RNA_type <- factor(vectorTPM_summary.log$RNA_type, levels = c("sense","antisense"))
+vectorTPM_summary.log$vector_annotation <- ""
+
+vectorTPM_summary.log$vector_annotation[vectorTPM_summary.log$RNA_type %in% "antisense"] = substr(vectorTPM_summary.log$Annotation[vectorTPM_summary.log$RNA_type %in% "antisense"],1,nchar(vectorTPM_summary.log$Annotation[vectorTPM_summary.log$RNA_type %in% "antisense"])-10)
+
+vectorTPM_summary.log$vector_annotation[vectorTPM_summary.log$RNA_type %in% "sense"] = substr(vectorTPM_summary.log$Annotation[vectorTPM_summary.log$RNA_type %in% "sense"],1,nchar(vectorTPM_summary.log$Annotation[vectorTPM_summary.log$RNA_type %in% "sense"])-6)
+
+vectorTPM_summary.log$Dose <- factor(vectorTPM_summary.log$Dose, levels = c("0","Low","High"))
+vectorTPM_summary.log$TissueSub <- factor(vectorTPM_summary.log$TissueSub, levels = c("Bst10","Bst11","Bst12", "CtxM","DrgC","DrgT","DrgL","ScC","ScT","ScL","LvL1","LvL2","LvR1","LvR2" ))
+```
+
+## Plotting log values
+
+Log2TPM+1 calculated and plotted as bar plot with mean, min and max
+```{r, fig.height=4, fig.width=16}
+
+for (i in unique(vectorTPM_summary.log$vector_annotation)) {
+  
+  temp <- vectorTPM_summary.log[vectorTPM_summary.log$vector_annotation %in% i,]
+  
+  p <- ggplot(temp, aes(x = Dose, y = mean, fill = RNA_type)) + 
+  geom_bar(stat="identity", position=position_dodge())+
+  geom_errorbar(aes(ymin=min, ymax=max),position=position_dodge(.9))+
+  ylab("Expression log2(TPM+1)") +
+#  scale_y_sqrt() +
+  facet_wrap(~TissueSub, ncol = 14) + ggtitle(i) +
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) 
+  print(p) 
+  ggsave(filename = paste0("/camhpc/ngs/projects/TST11724/scripts/plots/sense_antisense_log2/barplot/"
+                            ,i,".png"), 
+           plot = p)
+}
+
+```
+
+Log2TPM calculated and plotted as box plot with median, min and max
+
+```{r, fig.height=4, fig.width=16}
+for (i in c(vector)) {
+  temp <- vectorTPM_annot_long[vectorTPM_annot_long$vector_annotation %in% i,]
+  p <- ggplot(temp, aes(x = Dose, y = log2.tpm, fill = RNA_type)) + 
+  geom_boxplot() +
+  geom_point(pch = 21, position = position_jitterdodge()) +
+  ylab("Expression log2(TPM+1)") +
+  facet_wrap(~TissueSub, ncol = 14) + ggtitle(i) +
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) 
+  print(p)
+  ggsave(filename = paste0("/camhpc/ngs/projects/TST11724/scripts/plots/sense_antisense_log2/boxplot/",i,".png"),
+         plot = p)
+}
+```
+
+## Plotting tpm values in sqrt scale.
+Bar plots with mean and min, max
+```{r, fig.height=4, fig.width=16}
+
+for (i in unique(vectorTPM_summary$vector_annotation)) {
+  
+  temp <- vectorTPM_summary[vectorTPM_summary$vector_annotation %in% i,]
+  
+  p <- ggplot(temp, aes(x = Dose, y = mean, fill = RNA_type)) + 
+  geom_bar(stat="identity", position=position_dodge())+
+  geom_errorbar(aes(ymin=min, ymax=max),position=position_dodge(.9))+
+  ylab("Expression (TPM)") +
+  scale_y_sqrt() +
+  facet_wrap(~TissueSub, ncol = 14) + ggtitle(i) +
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) 
+  print(p) 
+  ggsave(filename = paste0("/camhpc/ngs/projects/TST11724/scripts/plots/sense_antisense/barplot_sqrt/"
+                           ,i,".png"),
+          plot = p)
+}
+
+```
+
+Box plots with median and min, max
+
+```{r, fig.height=4, fig.width=16}
+for (i in c(vector)) {
+  temp <- vectorTPM_annot_long[vectorTPM_annot_long$vector_annotation %in% i,]
+  p <- ggplot(temp, aes(x = Dose, y = value, fill = RNA_type)) + 
+  geom_boxplot()+
+  geom_point(pch = 21, position = position_jitterdodge(), width = 0.5) +
+  ylab("Expression (TPM)") +
+  scale_y_sqrt() +
+  #scale_y_continuous(trans='log10') +
+  facet_wrap(~TissueSub, ncol = 14) + ggtitle(i) +
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) 
+  print(p)
+  # ggsave(filename = paste0("/camhpc/ngs/projects/TST11724/scripts/plots/sense_antisense/boxplot_sqrt/"
+  #                          ,i,".png"), 
+  #         plot = p)
+}
+```
+
+# Ratios
+Lets plot of the Antisense/Sense ratios for each cargo element to see if there is any tissue with higher ratios. 
+
+```{r, fig.height=4, fig.width=16}
+sense <- vectorTPM_annot_long %>% filter(RNA_type == "sense")
+antisense <- vectorTPM_annot_long %>% filter(RNA_type == "antisense")
+sum(sense$SampleName.orig == antisense$SampleName.orig)
+sum(sense$vector_annotation == antisense$vector_annotation)
+ratio <- sense[,c("SampleName.orig","Dose","TissueSub","Vector","vector_annotation","Tissue")]
+ratio$ratio <- antisense$value/sense$value
+
+for (i in unique(ratio$vector_annotation)) {
+  temp <- ratio[ratio$vector_annotation %in% i,]
+  
+  p <- ggplot(temp, aes(x = Dose, y = ratio)) + 
+  geom_boxplot() +
+  geom_dotplot(binaxis='y', 
+               stackdir='center', 
+               dotsize = 1,
+               fill="black") +
+  scale_y_sqrt() +
+  ylab("Ratio Antisense-TPM/Sense-TPM") +
+  facet_wrap(~TissueSub, ncol = 14) + ggtitle(i) +
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) 
+  print(p)
+  # ggsave(filename = paste0("/camhpc/ngs/projects/TST11724/scripts/plots/ratios/",i,".png"), 
+  #        plot = p)
+}
+
+```
+
+```{r, fig.height=4, fig.width=10}
+for (i in as.character(unique(ratio$vector_annotation))) {
+  temp <- ratio[ratio$vector_annotation %in% i,]
+  
+  p <- ggplot(temp, aes(x = TissueSub, y = ratio, fill = Tissue)) + 
+  geom_boxplot() +
+  geom_dotplot(binaxis='y', 
+               stackdir='center', 
+               dotsize = 0.6,
+               fill="black") +
+  ylab("Antisense/Sense") +
+  # ylim(0,0.5) +
+  facet_wrap(~Dose, ncol = 14) + ggtitle(i) +
+  theme(axis.text.x = element_text(angle = 45, hjust=1, vjust = 1), plot.title = element_text(hjust = 0.5)) 
+  
+  print(p)
+  ggsave(filename = paste0("/camhpc/ngs/projects/TST11724/scripts/plots/ratios/",i,".png"),
+         plot = p)
+  
+}
+```
+
+
+```{r}
+all <- cbind(sense, antisense)
+write.csv(all, file = "/camhpc/ngs/projects/TST11724/scripts/data/tpm.values.csv", row.names = F, col.names = T, quote = F)
+```
+
+# Heatmap of cargo transcription
+
+Sense expression of cargo, with individual NHPs as rows.
+```{r, fig.height=16, fig.width=8}
+set.seed(1)
+library(ComplexHeatmap)
+
+mat.sense <- as.matrix(vectorTPM_annot[,c(21:32)])
+row.names(mat.sense) <- paste0(vectorTPM_annot$NHP_ID,"_",vectorTPM_annot$TissueSub)
+metadata <- vectorTPM_annot[,c(1:20)]
+row.names(metadata) <- paste0(vectorTPM_annot$NHP_ID,"_",vectorTPM_annot$TissueSub)
+#heat <- scale(mat.sense)
+heat <- mat.sense
+metadata$NHP_ID <- factor(metadata$NHP_ID)
+ann <- data.frame(
+    Tissue = metadata$Tissue,
+    NHP = metadata$NHP_ID,
+    Vector = metadata$Vector,
+    Dose = metadata$Dose,
+    TissueSub = metadata$TissueSub,
+    stringsAsFactors = FALSE)
+
+rowAnn <- HeatmapAnnotation(
+    df = ann,
+    which = 'row')
+
+ComplexHeatmap::Heatmap(heat, 
+                        name = "Tpm",
+                        cluster_columns = F,
+                        left_annotation = rowAnn)
+```
+
+Antisense cargo expression in idividual NHPs
+```{r, fig.height=16, fig.width=8}
+set.seed(1)
+library(ComplexHeatmap)
+
+mat.antisense <- as.matrix(vectorTPM_annot[,c(33:44)])
+row.names(mat.antisense) <- paste0(vectorTPM_annot$NHP_ID,"_",vectorTPM_annot$TissueSub)
+metadata <- vectorTPM_annot[,c(1:20)]
+row.names(metadata) <- paste0(vectorTPM_annot$NHP_ID,"_",vectorTPM_annot$TissueSub)
+heat <- scale(mat.antisense)
+metadata$NHP_ID <- factor(metadata$NHP_ID)
+ann <- data.frame(
+    Tissue = metadata$Tissue,
+    NHP = metadata$NHP_ID,
+    Vector = metadata$Vector,
+    Dose = metadata$Dose,
+    TissueSub = metadata$TissueSub,
+    stringsAsFactors = FALSE)
+
+rowAnn <- HeatmapAnnotation(
+    df = ann,
+    which = 'row')
+
+ComplexHeatmap::Heatmap(heat, 
+                        name = "Scaled_tpm",
+                        cluster_columns = F,
+                        left_annotation = rowAnn)
+```
+
+### Cargo expression Mean values
+**SENSE scaled:**
+```{r}
+vectorTPM_summary$vector_annotation <- factor(vectorTPM_summary$vector_annotation, levels = c("5_ITR","enhancer","chicken_b_actin_promoter","Enh_Prom","intron","5_miRE-mirimus","guide_amiRSOD1","miR_30a_loop","passenger_amiRSOD1","3_miRE","amiR","WPRE","polyA_signal", "3_ITR"))
+
+mean.sense <- vectorTPM_summary[vectorTPM_summary$RNA_type == "sense",]
+mean.sense.wide <- spread(as.data.frame(mean.sense[,c("TissueSub","mean","vector_annotation","Dose")]), vector_annotation, mean)
+
+mean.sense.wide$Tissue <- factor(dplyr::recode(mean.sense.wide$TissueSub,
+                                     "Bst10"="BST",
+                                     "Bst11"="BST", 
+                                     "Bst12"="BST",
+                                     "CtxM"="CTX",
+                                     "DrgC"="DRG",
+                                     "DrgL"="DRG",
+                                     "DrgT"="DRG",
+                                     "ScC"="SC",
+                                     "ScL"="SC",
+                                     "ScT"="SC",
+                                     "LvL1"="LIV",
+                                     "LvL2"="LIV",
+                                     "LvR1"="LIV",
+                                     "LvR2"="LIV"))
+
+mat.sense <- as.matrix(mean.sense.wide[,c("5_ITR","enhancer","chicken_b_actin_promoter","intron","5_miRE-mirimus","guide_amiRSOD1","miR_30a_loop","passenger_amiRSOD1","3_miRE","WPRE","polyA_signal","3_ITR")])
+
+colnames(mat.sense) <- factor(colnames(mat.sense), levels = c("5_ITR","enhancer","chicken_b_actin_promoter","intron","5_miRE-mirimus","guide_amiRSOD1","miR_30a_loop","passenger_amiRSOD1","3_miRE","WPRE","polyA_signal","3_ITR"))
+
+row.names(mat.sense) <- paste0(mean.sense.wide$TissueSub,"_",mean.sense.wide$Dose)
+metadata <- mean.sense.wide[,c("TissueSub","Dose","Tissue")]
+row.names(metadata) <- paste0(mean.sense.wide$TissueSub,"_",mean.sense.wide$Dose)
+heat.sense <- scale(mat.sense)
+
+ann <- data.frame(
+    Tissue = metadata$Tissue,
+    Dose = metadata$Dose,
+    stringsAsFactors = FALSE)
+
+colours <- list(
+    Tissue = c('BST' = 'blue', 'CTX' = 'red', 'DRG' = 'green3', 'SC' = 'yellow','LIV'='magenta'),
+    Dose = c('0' = '#C7E9C0', 'Low' = '#74C476', 'High' = '#00441B'))
+
+rowAnn <- HeatmapAnnotation(
+    df = ann,
+    which = 'row',
+    col = colours)
+```
+```{r, fig.height=10, fig.width=6}
+
+ComplexHeatmap::Heatmap(heat.sense, 
+                        name = "Sense TPM-Scaled",
+                        cluster_columns = F,
+                        row_km = 4,
+                        left_annotation = rowAnn)
+
+```
+```{r}
+
+png(filename = "/camhpc/ngs/projects/TST11724/scripts/plots/Sense_heatmap.png", width = 600, height = 800)
+ComplexHeatmap::Heatmap(heat.sense, 
+                        name = "TPM-Scaled",
+                        cluster_columns = F,
+                        row_km = 4,
+                        left_annotation = rowAnn)
+dev.off()
+```
+
+**SENSE, unscaled:**
+
+```{r}
+vectorTPM_summary$vector_annotation <- factor(vectorTPM_summary$vector_annotation, levels = c("5_ITR","enhancer","chicken_b_actin_promoter","Enh_Prom","intron","5_miRE-mirimus","guide_amiRSOD1","miR_30a_loop","passenger_amiRSOD1","3_miRE","amiR","WPRE","polyA_signal", "3_ITR"))
+
+mean.sense <- vectorTPM_summary[vectorTPM_summary$RNA_type == "sense",]
+mean.sense.wide <- spread(as.data.frame(mean.sense[,c("TissueSub","mean","vector_annotation","Dose")]), vector_annotation, mean)
+
+mean.sense.wide$Tissue <- factor(dplyr::recode(mean.sense.wide$TissueSub,
+                                     "Bst10"="BST",
+                                     "Bst11"="BST", 
+                                     "Bst12"="BST",
+                                     "CtxM"="CTX",
+                                     "DrgC"="DRG",
+                                     "DrgL"="DRG",
+                                     "DrgT"="DRG",
+                                     "ScC"="SC",
+                                     "ScL"="SC",
+                                     "ScT"="SC",
+                                     "LvL1"="LIV",
+                                     "LvL2"="LIV",
+                                     "LvR1"="LIV",
+                                     "LvR2"="LIV"))
+
+mat.sense <- as.matrix(mean.sense.wide[,c("5_ITR","enhancer","chicken_b_actin_promoter","intron","5_miRE-mirimus","guide_amiRSOD1","miR_30a_loop","passenger_amiRSOD1","3_miRE","WPRE","polyA_signal","3_ITR")])
+colnames(mat.sense) <- factor(colnames(mat.sense), levels = c("5_ITR","enhancer","chicken_b_actin_promoter","intron","5_miRE-mirimus","guide_amiRSOD1","miR_30a_loop","passenger_amiRSOD1","3_miRE","WPRE","polyA_signal","3_ITR"))
+row.names(mat.sense) <- paste0(mean.sense.wide$TissueSub,"_",mean.sense.wide$Dose)
+metadata <- mean.sense.wide[,c("TissueSub","Dose","Tissue")]
+row.names(metadata) <- paste0(mean.sense.wide$TissueSub,"_",mean.sense.wide$Dose)
+heat.sense <- mat.sense
+
+ann <- data.frame(
+    Tissue = metadata$Tissue,
+    Dose = metadata$Dose,
+    stringsAsFactors = FALSE)
+
+colours <- list(
+    Tissue = c('BST' = 'blue', 'CTX' = 'red', 'DRG' = 'green3', 'SC' = 'yellow','LIV'='magenta'),
+    Dose = c('0' = '#C7E9C0', 'Low' = '#74C476', 'High' = '#00441B'))
+
+rowAnn <- HeatmapAnnotation(
+    df = ann,
+    which = 'row',
+    col = colours)
+```
+```{r, fig.height=10, fig.width=6}
+
+ComplexHeatmap::Heatmap(heat.sense, 
+                        name = "Sense TPM",
+                        cluster_columns = F,
+                        row_km = 4,
+                        left_annotation = rowAnn)
+
+```
+
+```{r}
+
+png(filename = "/camhpc/ngs/projects/TST11724/scripts/plots/Sense_heatmap_unscaled.png", width = 600, height = 800)
+ComplexHeatmap::Heatmap(heat.sense, 
+                        name = "Sense TPM",
+                        cluster_columns = F,
+                        row_km = 4,
+                        left_annotation = rowAnn)
+dev.off()
+```
+
+**ANTISENSE scaled:**
+```{r}
+mean.antisense <- vectorTPM_summary[vectorTPM_summary$RNA_type == "antisense",]
+mean.antisense.wide <- spread(as.data.frame(mean.antisense[,c("TissueSub","mean","vector_annotation","Dose")]), vector_annotation, mean)
+
+mean.antisense.wide$Tissue <- factor(dplyr::recode(mean.antisense.wide$TissueSub,
+                                     "Bst10"="BST",
+                                     "Bst11"="BST", 
+                                     "Bst12"="BST",
+                                     "CtxM"="CTX",
+                                     "DrgC"="DRG",
+                                     "DrgL"="DRG",
+                                     "DrgT"="DRG",
+                                     "ScC"="SC",
+                                     "ScL"="SC",
+                                     "ScT"="SC",
+                                     "LvL1"="LIV",
+                                     "LvL2"="LIV",
+                                     "LvR1"="LIV",
+                                     "LvR2"="LIV"))
+
+mat.antisense <- as.matrix(mean.antisense.wide[,c("5_ITR","enhancer","chicken_b_actin_promoter","intron","5_miRE-mirimus","guide_amiRSOD1","miR_30a_loop","passenger_amiRSOD1","3_miRE","WPRE","polyA_signal","3_ITR")])
+colnames(mat.antisense) <- factor(colnames(mat.antisense), levels = c("5_ITR","enhancer","chicken_b_actin_promoter","intron","5_miRE-mirimus","guide_amiRSOD1","miR_30a_loop","passenger_amiRSOD1","3_miRE","WPRE","polyA_signal","3_ITR"))
+row.names(mat.antisense) <- paste0(mean.antisense.wide$TissueSub,"_",mean.antisense.wide$Dose)
+metadata <- mean.sense.wide[,c("TissueSub","Dose","Tissue")]
+row.names(metadata) <- paste0(mean.antisense.wide$TissueSub,"_",mean.antisense.wide$Dose)
+
+heat.antisense <- scale(mat.antisense)
+
+# gc$SampleName <- paste0(gc$Tissue2,"_",gc$dose)
+# 
+# metadata2 <- merge(metadata, gc, by.x = "row.names", by.y = "SampleName",all.x = T)
+# rownames(metadata2) <- metadata2$Row.names
+# metadata2 <- metadata2[rownames(metadata),]
+# rm(metadata)
+
+# metadata2 <- metadata2[,c("TissueSub","Dose.x","Tissue.x","Mean")]
+
+ann <- data.frame(
+    Tissue = metadata$Tissue,
+    Dose = metadata$Dose,
+    stringsAsFactors = FALSE)
+
+colours <- list(
+    Tissue = c('BST' = 'blue', 'CTX' = 'red', 'DRG' = 'green3', 'SC' = 'yellow','LIV'='magenta'),
+    Dose = c('0' = '#C7E9C0', 'Low' = '#74C476', 'High' = '#00441B'))
+
+rowAnn <- HeatmapAnnotation(
+    df = ann,
+    which = 'row',
+    col = colours)
+
+```
+
+```{r, fig.height=8, fig.width=6}
+ComplexHeatmap::Heatmap(heat.antisense, 
+                        name = "TPM-Scaled",
+                        cluster_columns = F,
+                        row_km = 4,
+                        left_annotation = rowAnn)
+```
+```{r}
+
+png(filename = "/camhpc/ngs/projects/TST11724/scripts/plots/Antisense_heatmap.png", width = 600, height = 800)
+ComplexHeatmap::Heatmap(heat.antisense, 
+                        name = "TPM-Scaled",
+                        cluster_columns = F,
+                        row_km = 4,
+                        left_annotation = rowAnn)
+dev.off()
+```
+
+**ANTISENSE unscaled:**
+```{r}
+mean.antisense <- vectorTPM_summary[vectorTPM_summary$RNA_type == "antisense",]
+mean.antisense.wide <- spread(as.data.frame(mean.antisense[,c("TissueSub","mean","vector_annotation","Dose")]), vector_annotation, mean)
+
+mean.antisense.wide$Tissue <- factor(dplyr::recode(mean.antisense.wide$TissueSub,
+                                     "Bst10"="BST",
+                                     "Bst11"="BST", 
+                                     "Bst12"="BST",
+                                     "CtxM"="CTX",
+                                     "DrgC"="DRG",
+                                     "DrgL"="DRG",
+                                     "DrgT"="DRG",
+                                     "ScC"="SC",
+                                     "ScL"="SC",
+                                     "ScT"="SC",
+                                     "LvL1"="LIV",
+                                     "LvL2"="LIV",
+                                     "LvR1"="LIV",
+                                     "LvR2"="LIV"))
+
+mat.antisense <- as.matrix(mean.antisense.wide[,c("5_ITR","enhancer","chicken_b_actin_promoter","intron","5_miRE-mirimus","guide_amiRSOD1","miR_30a_loop","passenger_amiRSOD1","3_miRE","WPRE","polyA_signal","3_ITR")])
+colnames(mat.antisense) <- factor(colnames(mat.antisense), levels = c("5_ITR","enhancer","chicken_b_actin_promoter","intron","5_miRE-mirimus","guide_amiRSOD1","miR_30a_loop","passenger_amiRSOD1","3_miRE","WPRE","polyA_signal","3_ITR"))
+row.names(mat.antisense) <- paste0(mean.antisense.wide$TissueSub,"_",mean.antisense.wide$Dose)
+metadata <- mean.antisense.wide[,c("TissueSub","Dose","Tissue")]
+row.names(metadata) <- paste0(mean.antisense.wide$TissueSub,"_",mean.antisense.wide$Dose)
+heat.antisense <- mat.antisense
+
+# gc$SampleName <- paste0(gc$Tissue2,"_",gc$dose)
+# metadata2 <- merge(metadata, gc, by.x = "row.names", by.y = "SampleName",all.x = T)
+# rownames(metadata2) <- metadata2$Row.names
+# metadata2 <- metadata2[rownames(metadata),]
+# rm(metadata)
+# 
+# metadata2 <- metadata2[,c("TissueSub","Dose.x","Tissue.x","Mean")]
+
+ann <- data.frame(
+    Tissue = metadata$Tissue,
+    Dose = metadata$Dose,
+    stringsAsFactors = FALSE)
+
+colours <- list(
+    Tissue = c('BST' = 'blue', 'CTX' = 'red', 'DRG' = 'green3', 'SC' = 'yellow','LIV'='magenta'),
+    Dose = c('0' = '#C7E9C0', 'Low' = '#74C476', 'High' = '#00441B'))
+
+rowAnn <- HeatmapAnnotation(
+    df = ann,
+    which = 'row',
+    col = colours)
+
+```
+
+```{r, fig.height=8, fig.width=6}
+ComplexHeatmap::Heatmap(heat.antisense, 
+                        name = "Antisense TPM",
+                        cluster_columns = F,
+                        row_km = 4,
+                        left_annotation = rowAnn)
+```
+
+```{r}
+
+png(filename = "/camhpc/ngs/projects/TST11724/scripts/plots/Antisense_heatmap_unscaled.png", width = 600, height = 800)
+ComplexHeatmap::Heatmap(heat.antisense, 
+                        name = "Antisense TPM",
+                        cluster_columns = F,
+                        row_km = 4,
+                        left_annotation = rowAnn)
+dev.off()
+```
+
+**Ratio, scaled:**
+
+```{r}
+mean.ratio <- mean.antisense.wide[,c("5_ITR","enhancer","chicken_b_actin_promoter","intron","5_miRE-mirimus","guide_amiRSOD1","miR_30a_loop","passenger_amiRSOD1","3_miRE","WPRE","polyA_signal","3_ITR")]/mean.sense.wide[,c("5_ITR","enhancer","chicken_b_actin_promoter","intron","5_miRE-mirimus","guide_amiRSOD1","miR_30a_loop","passenger_amiRSOD1","3_miRE","WPRE","polyA_signal","3_ITR")]
+mean.ratio <- cbind(mean.ratio, mean.sense.wide[c("Dose","Tissue","TissueSub")])
+
+mat.ratio <- as.matrix(mean.ratio[,c("5_ITR","enhancer","chicken_b_actin_promoter","intron","5_miRE-mirimus","guide_amiRSOD1","miR_30a_loop","passenger_amiRSOD1","3_miRE","WPRE","polyA_signal","3_ITR")])
+colnames(mat.ratio) <- factor(colnames(mat.ratio), levels = c("5_ITR","enhancer","chicken_b_actin_promoter","intron","5_miRE-mirimus","guide_amiRSOD1","miR_30a_loop","passenger_amiRSOD1","3_miRE","WPRE","polyA_signal","3_ITR"))
+row.names(mat.ratio) <- paste0(mean.ratio$TissueSub,"_",mean.ratio$Dose)
+metadata <- mean.ratio[,c(13:15)]
+row.names(metadata) <- paste0(mean.sense.wide$TissueSub,"_",mean.sense.wide$Dose)
+heat.ratio <- scale(mat.ratio)
+heat.ratio <- replace(heat.ratio, is.na(heat.ratio), 0)
+ann <- data.frame(
+    Tissue = metadata$Tissue,
+    Dose = metadata$Dose,
+    stringsAsFactors = FALSE)
+
+colours <- list(
+    Tissue = c('BST' = 'blue', 'CTX' = 'red', 'DRG' = 'green3', 'SC' = 'yellow','LIV'='magenta'),
+    Dose = c('0' = '#C7E9C0', 'Low' = '#74C476', 'High' = '#00441B'))
+
+rowAnn <- HeatmapAnnotation(
+    df = ann,
+    which = 'row',
+    col = colours)
+```
+```{r, fig.height=10, fig.width=6}
+
+ComplexHeatmap::Heatmap(heat.ratio, 
+                        name = "Ratio-Scaled",
+                        cluster_columns = F,
+                        row_km = 4,
+                        left_annotation = rowAnn)
+
+```
+```{r}
+
+png(filename = "/camhpc/ngs/projects/TST11724/scripts/plots/Ratio_heatmap.png", width = 600, height = 800)
+ComplexHeatmap::Heatmap(heat.ratio, 
+                        name = "Ratio AS/S-Scaled",
+                        cluster_columns = F,
+                        row_km = 4,
+                        left_annotation = rowAnn)
+dev.off()
+```
+
+**Ratio, unscaled**
+
+```{r}
+mean.ratio <- mean.antisense.wide[,c("5_ITR","enhancer","chicken_b_actin_promoter","intron","5_miRE-mirimus","guide_amiRSOD1","miR_30a_loop","passenger_amiRSOD1","3_miRE","WPRE","polyA_signal","3_ITR")]/mean.sense.wide[,c("5_ITR","enhancer","chicken_b_actin_promoter","intron","5_miRE-mirimus","guide_amiRSOD1","miR_30a_loop","passenger_amiRSOD1","3_miRE","WPRE","polyA_signal","3_ITR")]
+mean.ratio <- cbind(mean.ratio, mean.sense.wide[c("Dose","Tissue","TissueSub")])
+
+mat.ratio <- as.matrix(mean.ratio[,c("5_ITR","enhancer","chicken_b_actin_promoter","intron","5_miRE-mirimus","guide_amiRSOD1","miR_30a_loop","passenger_amiRSOD1","3_miRE","WPRE","polyA_signal","3_ITR")])
+colnames(mat.ratio) <- factor(colnames(mat.ratio), levels = c("5_ITR","enhancer","chicken_b_actin_promoter","intron","5_miRE-mirimus","guide_amiRSOD1","miR_30a_loop","passenger_amiRSOD1","3_miRE","WPRE","polyA_signal","3_ITR"))
+row.names(mat.ratio) <- paste0(mean.ratio$TissueSub,"_",mean.ratio$Dose)
+metadata <- mean.ratio[,c(13:15)]
+row.names(metadata) <- paste0(mean.sense.wide$TissueSub,"_",mean.sense.wide$Dose)
+heat.ratio <-mat.ratio
+heat.ratio <- replace(heat.ratio, is.na(heat.ratio), 0)
+heat.ratio <- replace(heat.ratio, !is.finite(heat.ratio), 0)
+ann <- data.frame(
+    Tissue = metadata$Tissue,
+    Dose = metadata$Dose,
+    stringsAsFactors = FALSE)
+
+colours <- list(
+    Tissue = c('BST' = 'blue', 'CTX' = 'red', 'DRG' = 'green3', 'SC' = 'yellow','LIV'='magenta'),
+    Dose = c('0' = '#C7E9C0', 'Low' = '#74C476', 'High' = '#00441B'))
+
+rowAnn <- HeatmapAnnotation(
+    df = ann,
+    which = 'row',
+    col = colours)
+```
+```{r, fig.height=10, fig.width=6}
+
+ComplexHeatmap::Heatmap(heat.ratio, 
+                        name = "Ratio",
+                        cluster_columns = F,
+                        row_km = 4,
+                        left_annotation = rowAnn)
+
+```
+```{r}
+
+png(filename = "/camhpc/ngs/projects/TST11724/scripts/plots/Ratio_heatmap_unscaled.png", width = 600, height = 800)
+ComplexHeatmap::Heatmap(heat.ratio, 
+                        name = "Ratio AS/S",
+                        cluster_columns = F,
+                        row_km = 4,
+                        left_annotation = rowAnn)
+dev.off()
+```
+
+# Plotting sense and antisense separately
+
+```{r, fig.height=5, fig.width=11}
+temp <- vectorTPM_annot_long[vectorTPM_annot_long$vector_annotation %in% c("WPRE","polyA_signal","3_ITR") & vectorTPM_annot_long$RNA_type %in% "sense",]
+  p <- ggplot(temp, aes(x = Dose, y = value, fill = Annotation)) + 
+  geom_boxplot() + 
+  ylab("Expression (TPM)") +
+  facet_wrap(~TissueSub, ncol = 7) + ggtitle("SENSE: WPRE, PolyA, 3_ITR") +
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) 
+  print(p)
+```
+
+```{r, fig.height=5, fig.width=11}
+ temp <- vectorTPM_annot_long[vectorTPM_annot_long$vector_annotation %in% c("WPRE","polyA_signal","3_ITR") & vectorTPM_annot_long$RNA_type %in% "antisense",]
+  p <- ggplot(temp, aes(x = Dose, y = value, fill = Annotation)) + 
+  geom_boxplot() + 
+  ylab("Expression (TPM)") +
+  facet_wrap(~TissueSub, ncol = 7) + ggtitle("ANTISENSE: WPRE, PolyA, 3_ITR") +
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) 
+  print(p)
+```
+```{r, fig.height=5, fig.width=9}
+temp <- vectorTPM_annot_long[vectorTPM_annot_long$vector_annotation %in% c("5_ITR","enhancer") & vectorTPM_annot_long$RNA_type %in% "sense",]
+  p <- ggplot(temp, aes(x = Dose, y = value, fill = Annotation)) + 
+  geom_boxplot() + 
+  ylab("Expression (TPM)") +
+  facet_wrap(~TissueSub, ncol = 7) + ggtitle("SENSE: 5_ITR, Enhancer") +
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) +
+  scale_fill_manual(values=c("red","gold"))
+  print(p)
+```
+
+```{r, fig.height=5, fig.width=9}
+ temp <- vectorTPM_annot_long[vectorTPM_annot_long$vector_annotation %in% c("5_ITR","enhancer") & vectorTPM_annot_long$RNA_type %in% "antisense",]
+  p <- ggplot(temp, aes(x = Dose, y = value, fill = Annotation)) + 
+  geom_boxplot() + 
+  ylab("Expression (TPM)") +
+  facet_wrap(~TissueSub, ncol = 7) + ggtitle("ANTISENSE: 5_ITR, Enhancer") +
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) +
+     scale_fill_manual(values=c("red","gold"))
+  print(p)
+```
+
+```{r, fig.height=5, fig.width=9}
+temp <- vectorTPM_annot_long[vectorTPM_annot_long$vector_annotation %in% c("chicken_b_actin_promoter","intron") & vectorTPM_annot_long$RNA_type %in% "sense",]
+  p <- ggplot(temp, aes(x = Dose, y = value, fill = Annotation)) + 
+  geom_boxplot() + 
+  ylab("Expression (TPM)") +
+  facet_wrap(~TissueSub, ncol = 7) + ggtitle("SENSE: promoter, intron") +
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) +
+  scale_fill_manual(values=c("tomato","slateblue1"))
+  print(p)
+```
+
+```{r, fig.height=5, fig.width=9}
+ temp <- vectorTPM_annot_long[vectorTPM_annot_long$vector_annotation %in% c("chicken_b_actin_promoter","intron") & vectorTPM_annot_long$RNA_type %in% "antisense",]
+  p <- ggplot(temp, aes(x = Dose, y = value, fill = Annotation)) + 
+  geom_boxplot() + 
+  ylab("Expression (TPM)") +
+  facet_wrap(~TissueSub, ncol = 7) + ggtitle("ANTISENSE: promoter, intron") +
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) +
+    scale_fill_manual(values=c("tomato","slateblue1"))
+  print(p)
+```
+
+```{r, fig.height=5, fig.width=11}
+temp <- vectorTPM_annot_long[vectorTPM_annot_long$vector_annotation %in% c("5_miRE-mirimus","guide_amiRSOD1","miR_30a_loop","passenger_amiRSOD1","3_miRE") & vectorTPM_annot_long$RNA_type %in% "sense",]
+  p <- ggplot(temp, aes(x = Dose, y = value, fill = Annotation)) + 
+  geom_boxplot() + 
+  ylab("Expression (TPM)") +
+  facet_wrap(~TissueSub, ncol = 7) + ggtitle("SENSE: amiR sequences") +
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5))
+  #scale_fill_manual(values=c("purple","springgreen","dodgerblue","gold"))
+  print(p)
+```
+
+```{r, fig.height=5, fig.width=11}
+ temp <- vectorTPM_annot_long[vectorTPM_annot_long$vector_annotation %in% c("5_miRE-mirimus","guide_amiRSOD1","miR_30a_loop","passenger_amiRSOD1","3_miRE") & vectorTPM_annot_long$RNA_type %in% "antisense",]
+  p <- ggplot(temp, aes(x = Dose, y = value, fill = Annotation)) + 
+  geom_boxplot() + 
+  ylab("Expression (TPM)") +
+  facet_wrap(~TissueSub, ncol = 7) + ggtitle("ANTISENSE: amiR sequences") +
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5))
+  print(p)
+```
+
+```{r}
+ensembl <- useMart("ensembl")
+ensembl = useDataset("mfascicularis_gene_ensembl",mart=ensembl)
+sod1_desc <- getBM(attributes=c('external_gene_name','description','ensembl_gene_id'), 
+                    filters = 'external_gene_name', 
+                    values = c("SOD1"), 
+                    mart =ensembl,
+                    useCache = FALSE)
+sod1_tpm <-as.data.frame(tpm[sod1_desc$ensembl_gene_id,]) 
+temp <- rownames(sod1_tpm)
+sod1_tpm <- mutate_all(sod1_tpm, function(x) as.numeric(as.character(x)))
+rownames(sod1_tpm) <- temp
+colnames(sod1_tpm) <- sod1_desc$external_gene_name
+
+sod1TPM_annot <- merge(samplesheet, sod1_tpm, by="row.names")
+sod1TPM_annot <- sod1TPM_annot[,-1]
+sod1TPM_annot$Dose <- factor(sod1TPM_annot$Dose, levels = c("0","Low","High"))
+
+ p <- ggplot(sod1TPM_annot, aes(x = Dose, y = SOD1)) + 
+  geom_boxplot() + 
+  ylab("Expression (TPM)") +
+  facet_wrap(~TissueSub, ncol = 7) + ggtitle(sod1_desc$external_gene_name) +
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) 
+  print(p)
+
+```
+
+# Genome copies
+
+Joyce Lo shared qPCR data of quantification of viral genome. Data is generated from the same animals/tissues but not exactly the same samples/tissue levels.
+
+```{r}
+gc <- read.table("/camhpc/ngs/projects/TST11724/scripts/data/Genome_copies.txt", sep = "\t", header = T)
+gc$Dose <- factor(gc$Dose)
+gc$dose <- factor(dplyr::recode(gc$Dose,
+                                "0"="0", 
+                                "7.5e+13"="Low",
+                                "1.5e+14"="High"), levels = c("0","Low","High"))
+gc$Vector2 <- factor(dplyr::recode(gc$Vector,
+                                "Reference Item"="aCSF", 
+                                "Test Item 1"="V76",
+                                "Test Item 2"="V79"))
+gc <- gc[gc$Vector2%in%c("aCSF","V79"),]
+gc$Tissue <- factor(gc$Tissue, levels = c("Brainstem 10 ",
+                                          "Brainstem10 2nd ",
+                                          "Brainstem 11 ",
+                                          "Brainstem 12 ",
+                                          "Brainstem 13 ",
+                                          "BR Motor Cortex ",
+                                          "DRG Cervical pool ",
+                                          "DRG Lumbar pool ",
+                                          "DRG Thoracic pool ",
+                                          "SC Cervical ",
+                                          "SC Lumbar ",
+                                          "SC Thoracic ",
+                                          "Liver LT ",
+                                          "Liver LT 2nd",
+                                          "Liver RT ",
+                                          "Liver RT 2nd",
+                                          "Lung 2nd",
+                                          "Blood, Day 1, H0",
+                                          "Blood, Day 1, H2",
+                                          "Blood, Day 15",
+                                          "Blood, Day 43"))
+gc$Tissue2 <- factor(dplyr::recode(gc$Tissue,
+                                   "Brainstem 10 "="Bst10",
+                                    "Brainstem10 2nd "="Bst10_2",
+                                    "Brainstem 11 "="Bst11",
+                                    "Brainstem 12 "="Bst12",
+                                    "Brainstem 13 "="Bst13",
+                                    "BR Motor Cortex "="CtxM",
+                                    "DRG Cervical pool "="DrgC",
+                                    "DRG Lumbar pool "="DrgL",
+                                    "DRG Thoracic pool "="DrgT",
+                                    "SC Cervical "="ScC",
+                                    "SC Lumbar "="ScL",
+                                    "SC Thoracic "="ScT",
+                                    "Liver LT "="LvL1",
+                                    "Liver LT 2nd"="LvL2",
+                                    "Liver RT "="LvR1",
+                                    "Liver RT 2nd"="LvR2",
+                                    "Lung 2nd"="Lung",
+                                    "Blood, Day 1, H0"="BloodH0.D1",
+                                    "Blood, Day 1, H2"="BloodH2.D1",
+                                    "Blood, Day 15"="Blood.D15",
+                                    "Blood, Day 43"="Blood.D43"))
+```
+
+```{r, fig.height=4, fig.width=12}
+ggplot(gc, aes(x = Tissue2, y = Mean)) + 
+  geom_bar(stat="identity", position=position_dodge())+
+  geom_errorbar(aes(ymin=Mean-Stdev, ymax=Mean+Stdev),position=position_dodge(.9))+
+  ylab("genome copies per µg of tissue DNA") +
+  # scale_y_sqrt() +
+  facet_wrap(~dose, ncol = 6)  +
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) 
+```
+```{r, fig.height=4, fig.width=12}
+
+gc.subset7 <- gc[gc$Tissue %in%  c("BR Motor Cortex ","Brainstem 10 ","Brainstem 11 ","Brainstem 12 ","Brainstem 13 ","Brainstem10 2nd "),]
+
+gc.subset7$Tissue <- factor(gc.subset7$Tissue, levels = c("Brainstem 10 ","Brainstem10 2nd ","Brainstem 11 ","Brainstem 12 ","Brainstem 13 ","BR Motor Cortex ","DRG Cervical pool ","DRG Lumbar pool ","DRG Thoracic pool ","SC Cervical ","SC Lumbar ","SC Thoracic ","Liver LT ","Liver LT 2nd","Liver RT ","Liver RT 2nd"))
+
+ggplot(gc.subset7, aes(x = dose, y = Mean)) + 
+  geom_bar(stat="identity", position=position_dodge())+
+  geom_errorbar(aes(ymin=Mean-Stdev, ymax=Mean+Stdev),position=position_dodge(.9))+
+  ylab("genome copies per µg of tissue DNA") +
+  # scale_y_sqrt() +
+  facet_wrap(~Tissue2, ncol = 6)  +
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) 
+```
+```{r,fig.height=4, fig.width=8}
+ggplot(gc.subset7, aes(x = Tissue2, y = Mean, fill = Tissue2)) + 
+  geom_bar(stat="identity", position=position_dodge())+
+  geom_errorbar(aes(ymin=Mean-Stdev, ymax=Mean+Stdev),position=position_dodge(.9))+
+  ylab("genome copies per µg of tissue DNA") +
+  scale_y_sqrt() +
+  facet_wrap(~dose, ncol = 6)  +
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) 
+```
+```{r, fig.height=4, fig.width=12}
+
+gc.subset3 <- gc[gc$Tissue %in%  c("BR Motor Cortex ","Brainstem 10 ","Brainstem 11 ","Brainstem 13 ","Brainstem10 2nd "),]
+
+gc.subset3$Tissue <- factor(gc.subset3$Tissue, levels = c("Brainstem 10 ","Brainstem10 2nd ","Brainstem 11 ","Brainstem 12 ","Brainstem 13 ","BR Motor Cortex ","DRG Cervical pool ","DRG Lumbar pool ","DRG Thoracic pool ","SC Cervical ","SC Lumbar ","SC Thoracic ","Liver LT ","Liver LT 2nd","Liver RT ","Liver RT 2nd"))
+
+ggplot(gc.subset3, aes(x = dose, y = Mean)) + 
+  geom_bar(stat="identity", position=position_dodge())+
+  geom_errorbar(aes(ymin=Mean-Stdev, ymax=Mean+Stdev),position=position_dodge(.9))+
+  ylab("genome copies per µg of tissue DNA") +
+  # scale_y_sqrt() +
+  facet_wrap(~Tissue2, ncol = 6)  +
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) 
+```
+```{r,fig.height=4, fig.width=8}
+ggplot(gc.subset3, aes(x = Tissue2, y = Mean, fill = Tissue2)) + 
+  geom_bar(stat="identity", position=position_dodge())+
+  geom_errorbar(aes(ymin=Mean-Stdev, ymax=Mean+Stdev),position=position_dodge(.9))+
+  ylab("genome copies per µg of tissue DNA") +
+  # scale_y_sqrt() +
+  facet_wrap(~dose, ncol = 6)  +
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) 
+```
+```{r, fig.height=4, fig.width=12}
+
+gc.subset6 <- gc[gc$Tissue %in%  c("Brainstem 12 "),]
+
+gc.subset6$Tissue <- factor(gc.subset6$Tissue, levels = c("Brainstem 10 ","Brainstem10 2nd ","Brainstem 11 ","Brainstem 12 ","Brainstem 13 ","BR Motor Cortex ","DRG Cervical pool ","DRG Lumbar pool ","DRG Thoracic pool ","SC Cervical ","SC Lumbar ","SC Thoracic ","Liver LT ","Liver LT 2nd","Liver RT ","Liver RT 2nd"))
+
+ggplot(gc.subset6, aes(x = dose, y = Mean)) + 
+  geom_bar(stat="identity", position=position_dodge())+
+  geom_errorbar(aes(ymin=Mean-Stdev, ymax=Mean+Stdev),position=position_dodge(.9))+
+  ylab("genome copies per µg of tissue DNA") +
+  # scale_y_sqrt() +
+  facet_wrap(~Tissue2, ncol = 6)  +
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) 
+```
+```{r,fig.height=4, fig.width=4}
+ggplot(gc.subset6, aes(x = Tissue2, y = Mean, fill = Tissue2)) + 
+  geom_bar(stat="identity", position=position_dodge())+
+  geom_errorbar(aes(ymin=Mean-Stdev, ymax=Mean+Stdev),position=position_dodge(.9))+
+  ylab("genome copies per µg of tissue DNA") +
+  # scale_y_sqrt() +
+  facet_wrap(~dose, ncol = 6)  +
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) 
+```
+
+```{r, fig.height=4, fig.width=12}
+
+gc.subset1 <- gc[gc$Tissue %in%  c("DRG Cervical pool ","DRG Lumbar pool ","DRG Thoracic pool ","SC Cervical ","SC Lumbar ","SC Thoracic "),]
+
+gc.subset1$Tissue <- factor(gc.subset1$Tissue, levels = c("Brainstem 10 ","Brainstem10 2nd ","Brainstem 11 ","Brainstem 12 ","Brainstem 13 ","BR Motor Cortex ","DRG Cervical pool ","DRG Lumbar pool ","DRG Thoracic pool ","SC Cervical ","SC Lumbar ","SC Thoracic ","Liver LT ","Liver LT 2nd","Liver RT ","Liver RT 2nd"))
+
+ggplot(gc.subset1, aes(x = dose, y = Mean, fill=Tissue2)) + 
+  geom_bar(stat="identity", position=position_dodge())+
+  geom_errorbar(aes(ymin=Mean-Stdev, ymax=Mean+Stdev),position=position_dodge(.9))+
+  ylab("genome copies per µg of tissue DNA") +
+  # scale_y_sqrt() +
+  facet_wrap(~Tissue2, ncol = 6)  +
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) +
+  scale_y_continuous(labels = function(x) format(x, scientific = TRUE))
+```
+```{r,fig.height=4, fig.width=8}
+ggplot(gc.subset1, aes(x = Tissue2, y = Mean, fill = Tissue2)) + 
+  geom_bar(stat="identity", position=position_dodge())+
+  geom_errorbar(aes(ymin=Mean-Stdev, ymax=Mean+Stdev),position=position_dodge(.9))+
+  ylab("genome copies per µg of tissue DNA") +
+  # scale_y_sqrt() +
+  facet_wrap(~dose, ncol = 6)  +
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) +
+  scale_y_continuous(labels = function(x) format(x, scientific = TRUE))
+```
+```{r, fig.height=5, fig.width=12}
+gc.subset2 <- gc[gc$Tissue %in%  c("Liver LT ","Liver LT 2nd","Liver RT ","Liver RT 2nd"),]
+
+ggplot(gc.subset2, aes(x = dose, y = Mean, fill = Tissue2)) + 
+  geom_bar(stat="identity", position=position_dodge())+
+  geom_errorbar(aes(ymin=Mean-Stdev, ymax=Mean+Stdev),position=position_dodge(.9))+
+  ylab("genome copies per µg of tissue DNA") +
+#  scale_y_sqrt() +
+  facet_wrap(~Tissue2, ncol = 6)  +
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) 
+
+
+```
+```{r,fig.height=4, fig.width=8}
+ggplot(gc.subset2, aes(x = Tissue2, y = Mean, fill = Tissue2)) + 
+  geom_bar(stat="identity", position=position_dodge())+
+  geom_errorbar(aes(ymin=Mean-Stdev, ymax=Mean+Stdev),position=position_dodge(.9))+
+  ylab("genome copies per µg of tissue DNA") +
+  # scale_y_sqrt() +
+  facet_wrap(~dose, ncol = 6)  +
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) +
+  scale_y_continuous(labels = function(x) format(x, scientific = TRUE))
+```
+```{r, fig.height=3, fig.width=8}
+gc.subset4 <- gc[gc$Tissue %in%  c("Blood, Day 1, H0","Blood, Day 1, H2","Blood, Day 15","Blood, Day 43"),]
+
+ggplot(gc.subset4, aes(x = dose, y = Mean, fill = Tissue2)) + 
+  geom_bar(stat="identity", position=position_dodge())+
+  geom_errorbar(aes(ymin=Mean-Stdev, ymax=Mean+Stdev),position=position_dodge(.9))+
+  ylab("genome copies per µg of tissue DNA") +
+  scale_y_sqrt() +
+  facet_wrap(~Tissue2, ncol = 4)  +
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) 
+```
+
+```{r,fig.height=4, fig.width=8}
+ggplot(gc.subset4, aes(x = Tissue2, y = Mean, fill = Tissue2)) + 
+  geom_bar(stat="identity", position=position_dodge())+
+  geom_errorbar(aes(ymin=Mean-Stdev, ymax=Mean+Stdev),position=position_dodge(.9))+
+  ylab("genome copies per µg of tissue DNA") +
+  scale_y_sqrt() +
+  facet_wrap(~dose)  +
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) +
+  scale_y_continuous(labels = function(x) format(x, scientific = TRUE))
+```
+
+
+# Genome copies correlated with cargo expression
+SENSE:
+```{r}
+mean.sense <- vectorTPM_summary[vectorTPM_summary$RNA_type == "sense",]
+mean.sense.wide <- spread(as.data.frame(mean.sense[,c("TissueSub","mean","vector_annotation","Dose")]), vector_annotation, mean)
+
+mean.sense.wide$Tissue <- factor(dplyr::recode(mean.sense.wide$TissueSub,
+                                     "Bst10"="BST",
+                                     "Bst11"="BST", 
+                                     "Bst12"="BST",
+                                     "CtxM"="CTX",
+                                     "DrgC"="DRG",
+                                     "DrgL"="DRG",
+                                     "DrgT"="DRG",
+                                     "ScC"="SC",
+                                     "ScL"="SC",
+                                     "ScT"="SC",
+                                     "LvL1"="LIV",
+                                     "LvL2"="LIV",
+                                     "LvR1"="LIV",
+                                     "LvR2"="LIV"))
+
+mat.sense <- as.matrix(mean.sense.wide[,c("5_ITR","enhancer","chicken_b_actin_promoter","intron","5_miRE-mirimus","guide_amiRSOD1","miR_30a_loop","passenger_amiRSOD1","3_miRE","WPRE","polyA_signal","3_ITR")])
+
+colnames(mat.sense) <- factor(colnames(mat.sense), levels = c("5_ITR","enhancer","chicken_b_actin_promoter","intron","5_miRE-mirimus","guide_amiRSOD1","miR_30a_loop","passenger_amiRSOD1","3_miRE","WPRE","polyA_signal","3_ITR"))
+
+row.names(mat.sense) <- paste0(mean.sense.wide$TissueSub,"_",mean.sense.wide$Dose)
+metadata <- mean.sense.wide[,c("TissueSub","Dose","Tissue")]
+row.names(metadata) <- paste0(mean.sense.wide$TissueSub,"_",mean.sense.wide$Dose)
+
+heat.sense <- scale(mat.sense)
+
+gc$SampleName <- paste0(gc$Tissue2,"_",gc$dose)
+metadata2 <- merge(metadata, gc, by.x = "row.names", by.y = "SampleName",all.x = T)
+rownames(metadata2) <- metadata2$Row.names
+metadata2 <- metadata2[rownames(metadata),]
+rm(metadata)
+
+metadata2 <- metadata2[,c("TissueSub","Dose.x","Tissue.x","Mean")]
+
+ann <- data.frame(
+    Tissue = metadata2$Tissue.x,
+    Dose = metadata2$Dose.x,
+    stringsAsFactors = FALSE)
+
+colours <- list(
+    Tissue = c('BST' = 'blue', 'CTX' = 'red', 'DRG' = 'green3', 'SC' = 'yellow','LIV'='magenta'),
+    Dose = c('0' = '#C7E9C0', 'Low' = '#74C476', 'High' = '#00441B'))
+
+rowAnn <- HeatmapAnnotation(
+    df = ann,
+    which = 'row',
+    col = colours)
+```
+
+
+```{r}
+barplotRow <- HeatmapAnnotation(
+    VectorGenome = row_anno_barplot(
+      metadata2[,"Mean"],
+      border = FALSE,
+      gp = gpar(fill = '#CCCCCC'),
+      pch = '.',
+      size = unit(2, 'mm'),
+      axis = TRUE,
+      axis_param = list(
+        gp = gpar(fontsize = 12),
+        side = 'top')),
+      annotation_width = unit(c(2.0), 'cm'),
+      which = 'row')
+
+```
+```{r, fig.height=10, fig.width=8}
+
+ComplexHeatmap::Heatmap(heat.sense,
+                        name = "Sense TPM-Scaled",
+                        cluster_columns = F,
+                        row_km = 4,
+                        left_annotation = rowAnn,
+                        right_annotation = barplotRow)
+```
+
+```{r}
+
+png(filename = "/camhpc/ngs/projects/TST11724/scripts/plots/Sense_heatmap_VectorGenome.png", width = 700, height = 800)
+ComplexHeatmap::Heatmap(heat.sense, 
+                        name = "TPM-Scaled",
+                        cluster_columns = F,
+                        row_km = 4,
+                        left_annotation = rowAnn,
+                        right_annotation = barplotRow)
+dev.off()
+```
+
+**SENSE unscaled:**
+```{r}
+
+mean.sense <- vectorTPM_summary[vectorTPM_summary$RNA_type == "sense",]
+mean.sense.wide <- spread(as.data.frame(mean.sense[,c("TissueSub","mean","vector_annotation","Dose")]), vector_annotation, mean)
+
+mean.sense.wide$Tissue <- factor(dplyr::recode(mean.sense.wide$TissueSub,
+                                     "Bst10"="BST",
+                                     "Bst11"="BST", 
+                                     "Bst12"="BST",
+                                     "CtxM"="CTX",
+                                     "DrgC"="DRG",
+                                     "DrgL"="DRG",
+                                     "DrgT"="DRG",
+                                     "ScC"="SC",
+                                     "ScL"="SC",
+                                     "ScT"="SC",
+                                     "LvL1"="LIV",
+                                     "LvL2"="LIV",
+                                     "LvR1"="LIV",
+                                     "LvR2"="LIV"))
+
+mat.sense <- as.matrix(mean.sense.wide[,c("5_ITR","enhancer","chicken_b_actin_promoter","intron","5_miRE-mirimus","guide_amiRSOD1","miR_30a_loop","passenger_amiRSOD1","3_miRE","WPRE","polyA_signal","3_ITR")])
+colnames(mat.sense) <- factor(colnames(mat.sense), levels = c("5_ITR","enhancer","chicken_b_actin_promoter","intron","5_miRE-mirimus","guide_amiRSOD1","miR_30a_loop","passenger_amiRSOD1","3_miRE","WPRE","polyA_signal","3_ITR"))
+row.names(mat.sense) <- paste0(mean.sense.wide$TissueSub,"_",mean.sense.wide$Dose)
+metadata <- mean.sense.wide[,c("TissueSub","Dose","Tissue")]
+row.names(metadata) <- paste0(mean.sense.wide$TissueSub,"_",mean.sense.wide$Dose)
+
+heat.sense <- mat.sense
+
+gc$SampleName <- paste0(gc$Tissue2,"_",gc$dose)
+metadata2 <- merge(metadata, gc, by.x = "row.names", by.y = "SampleName",all.x = T)
+rownames(metadata2) <- metadata2$Row.names
+metadata2 <- metadata2[rownames(metadata),]
+rm(metadata)
+
+metadata2 <- metadata2[,c("TissueSub","Dose.x","Tissue.x","Mean")]
+
+ann <- data.frame(
+    Tissue = metadata2$Tissue.x,
+    Dose = metadata2$Dose.x,
+    stringsAsFactors = FALSE)
+
+colours <- list(
+    Tissue = c('BST' = 'blue', 'CTX' = 'red', 'DRG' = 'green3', 'SC' = 'yellow','LIV'='magenta'),
+    Dose = c('0' = '#C7E9C0', 'Low' = '#74C476', 'High' = '#00441B'))
+
+rowAnn <- HeatmapAnnotation(
+    df = ann,
+    which = 'row',
+    col = colours)
+```
+
+
+```{r}
+barplotRow <- HeatmapAnnotation(
+    VectorGenome = row_anno_barplot(
+      metadata2[,"Mean"],
+      border = FALSE,
+      gp = gpar(fill = '#CCCCCC'),
+      pch = '.',
+      size = unit(2, 'mm'),
+      axis = TRUE,
+      axis_param = list(
+        gp = gpar(fontsize = 12),
+        side = 'top')),
+      annotation_width = unit(c(2.0), 'cm'),
+      which = 'row')
+
+```
+```{r, fig.height=10, fig.width=8}
+
+ComplexHeatmap::Heatmap(heat.sense,
+                        name = "Sense TPM",
+                        cluster_columns = F,
+                        row_km = 4,
+                        left_annotation = rowAnn,
+                        right_annotation = barplotRow)
+```
+
+```{r}
+
+png(filename = "/camhpc/ngs/projects/TST11724/scripts/plots/Sense_heatmap_unscaled_VectorGenome.png", width = 700, height = 800)
+ComplexHeatmap::Heatmap(heat.sense, 
+                        name = "Sense TPM",
+                        cluster_columns = F,
+                        row_km = 4,
+                        left_annotation = rowAnn,
+                        right_annotation = barplotRow)
+dev.off()
+```
+
+**ANTISENSE scaled:** 
+
+```{r}
+
+mean.antisense <- vectorTPM_summary[vectorTPM_summary$RNA_type == "antisense",]
+mean.antisense.wide <- spread(as.data.frame(mean.antisense[,c("TissueSub","mean","vector_annotation","Dose")]), vector_annotation, mean)
+
+mean.antisense.wide$Tissue <- factor(dplyr::recode(mean.antisense.wide$TissueSub,
+                                     "Bst10"="BST",
+                                     "Bst11"="BST", 
+                                     "Bst12"="BST",
+                                     "CtxM"="CTX",
+                                     "DrgC"="DRG",
+                                     "DrgL"="DRG",
+                                     "DrgT"="DRG",
+                                     "ScC"="SC",
+                                     "ScL"="SC",
+                                     "ScT"="SC",
+                                     "LvL1"="LIV",
+                                     "LvL2"="LIV",
+                                     "LvR1"="LIV",
+                                     "LvR2"="LIV"))
+
+mat.antisense <- as.matrix(mean.antisense.wide[,c("5_ITR","enhancer","chicken_b_actin_promoter","intron","5_miRE-mirimus","guide_amiRSOD1","miR_30a_loop","passenger_amiRSOD1","3_miRE","WPRE","polyA_signal","3_ITR")])
+colnames(mat.antisense) <- factor(colnames(mat.antisense), levels = c("5_ITR","enhancer","chicken_b_actin_promoter","intron","5_miRE-mirimus","guide_amiRSOD1","miR_30a_loop","passenger_amiRSOD1","3_miRE","WPRE","polyA_signal","3_ITR"))
+row.names(mat.antisense) <- paste0(mean.antisense.wide$TissueSub,"_",mean.antisense.wide$Dose)
+metadata <- mean.antisense.wide[,c("TissueSub","Dose","Tissue")]
+row.names(metadata) <- paste0(mean.antisense.wide$TissueSub,"_",mean.antisense.wide$Dose)
+
+heat.antisense <- scale(mat.antisense)
+
+gc$SampleName <- paste0(gc$Tissue2,"_",gc$dose)
+metadata2 <- merge(metadata, gc, by.x = "row.names", by.y = "SampleName",all.x = T)
+rownames(metadata2) <- metadata2$Row.names
+metadata2 <- metadata2[rownames(metadata),]
+rm(metadata)
+
+metadata2 <- metadata2[,c("TissueSub","Dose.x","Tissue.x","Mean")]
+
+ann <- data.frame(
+    Tissue = metadata2$Tissue.x,
+    Dose = metadata2$Dose.x,
+    stringsAsFactors = FALSE)
+
+colours <- list(
+    Tissue = c('BST' = 'blue', 'CTX' = 'red', 'DRG' = 'green3', 'SC' = 'yellow','LIV'='magenta'),
+    Dose = c('0' = '#C7E9C0', 'Low' = '#74C476', 'High' = '#00441B'))
+
+rowAnn <- HeatmapAnnotation(
+    df = ann,
+    which = 'row',
+    col = colours)
+```
+
+
+```{r}
+barplotRow <- HeatmapAnnotation(
+    VectorGenome = row_anno_barplot(
+      metadata2[,"Mean"],
+      border = FALSE,
+      gp = gpar(fill = '#CCCCCC'),
+      pch = '.',
+      size = unit(2, 'mm'),
+      axis = TRUE,
+      axis_param = list(
+        gp = gpar(fontsize = 12),
+        side = 'top')),
+      annotation_width = unit(c(2.0), 'cm'),
+      which = 'row')
+
+```
+```{r, fig.height=10, fig.width=8}
+
+ComplexHeatmap::Heatmap(heat.antisense,
+                        name = "antisense TPM-Scaled",
+                        cluster_columns = F,
+                        row_km = 4,
+                        left_annotation = rowAnn,
+                        right_annotation = barplotRow)
+```
+
+```{r}
+
+png(filename = "/camhpc/ngs/projects/TST11724/scripts/plots/antisense_heatmap_VectorGenome.png", width = 700, height = 800)
+ComplexHeatmap::Heatmap(heat.antisense, 
+                        name = "TPM-Scaled",
+                        cluster_columns = F,
+                        row_km = 4,
+                        left_annotation = rowAnn,
+                        right_annotation = barplotRow)
+dev.off()
+```
+
+**ANTISENSE unscaled:**
+
+```{r}
+
+mean.antisense <- vectorTPM_summary[vectorTPM_summary$RNA_type == "antisense",]
+mean.antisense.wide <- spread(as.data.frame(mean.antisense[,c("TissueSub","mean","vector_annotation","Dose")]), vector_annotation, mean)
+
+mean.antisense.wide$Tissue <- factor(dplyr::recode(mean.antisense.wide$TissueSub,
+                                     "Bst10"="BST",
+                                     "Bst11"="BST", 
+                                     "Bst12"="BST",
+                                     "CtxM"="CTX",
+                                     "DrgC"="DRG",
+                                     "DrgL"="DRG",
+                                     "DrgT"="DRG",
+                                     "ScC"="SC",
+                                     "ScL"="SC",
+                                     "ScT"="SC",
+                                     "LvL1"="LIV",
+                                     "LvL2"="LIV",
+                                     "LvR1"="LIV",
+                                     "LvR2"="LIV"))
+
+mat.antisense <- as.matrix(mean.antisense.wide[,c("5_ITR","enhancer","chicken_b_actin_promoter","intron","5_miRE-mirimus","guide_amiRSOD1","miR_30a_loop","passenger_amiRSOD1","3_miRE","WPRE","polyA_signal","3_ITR")])
+colnames(mat.antisense) <- factor(colnames(mat.antisense), levels = c("5_ITR","enhancer","chicken_b_actin_promoter","intron","5_miRE-mirimus","guide_amiRSOD1","miR_30a_loop","passenger_amiRSOD1","3_miRE","WPRE","polyA_signal","3_ITR"))
+row.names(mat.antisense) <- paste0(mean.antisense.wide$TissueSub,"_",mean.antisense.wide$Dose)
+metadata <- mean.antisense.wide[,c("TissueSub","Dose","Tissue")]
+row.names(metadata) <- paste0(mean.antisense.wide$TissueSub,"_",mean.antisense.wide$Dose)
+
+heat.antisense <- mat.antisense
+
+gc$SampleName <- paste0(gc$Tissue2,"_",gc$dose)
+metadata2 <- merge(metadata, gc, by.x = "row.names", by.y = "SampleName",all.x = T)
+rownames(metadata2) <- metadata2$Row.names
+metadata2 <- metadata2[rownames(metadata),]
+rm(metadata)
+
+metadata2 <- metadata2[,c("TissueSub","Dose.x","Tissue.x","Mean")]
+
+ann <- data.frame(
+    Tissue = metadata2$Tissue.x,
+    Dose = metadata2$Dose.x,
+    stringsAsFactors = FALSE)
+
+colours <- list(
+    Tissue = c('BST' = 'blue', 'CTX' = 'red', 'DRG' = 'green3', 'SC' = 'yellow','LIV'='magenta'),
+    Dose = c('0' = '#C7E9C0', 'Low' = '#74C476', 'High' = '#00441B'))
+
+rowAnn <- HeatmapAnnotation(
+    df = ann,
+    which = 'row',
+    col = colours)
+```
+
+
+```{r}
+barplotRow <- HeatmapAnnotation(
+    VectorGenome = row_anno_barplot(
+      metadata2[,"Mean"],
+      border = FALSE,
+      gp = gpar(fill = '#CCCCCC'),
+      pch = '.',
+      size = unit(2, 'mm'),
+      axis = TRUE,
+      axis_param = list(
+        gp = gpar(fontsize = 12),
+        side = 'top')),
+      annotation_width = unit(c(2.0), 'cm'),
+      which = 'row')
+
+```
+```{r, fig.height=10, fig.width=8}
+
+ComplexHeatmap::Heatmap(heat.antisense,
+                        name = "Antisense TPM",
+                        cluster_columns = F,
+                        row_km = 4,
+                        left_annotation = rowAnn,
+                        right_annotation = barplotRow)
+```
+
+```{r}
+
+png(filename = "/camhpc/ngs/projects/TST11724/scripts/plots/antisense_heatmap_unscaled_VectorGenome.png", width = 700, height = 800)
+ComplexHeatmap::Heatmap(heat.antisense, 
+                        name = "Antisense TPM",
+                        cluster_columns = F,
+                        row_km = 4,
+                        left_annotation = rowAnn,
+                        right_annotation = barplotRow)
+dev.off()
+```
+
+#  Tox scores - Histopath
+
+Hispath scores were calculated by Prasad Nadella, Nick Van der Munnik. The contralateral tissue from these animals were taken for Histopath. Lets read the scores here and make some plots. 
+
+```{r}
+tox <- read.csv(file = "/camhpc/ngs/projects/TST11724/scripts/data/HISTOPATH_int_delineated.csv", header = T)
+tox$dose <- factor(dplyr::recode(tox$DOSE,
+                                "0"="0", 
+                                "7.5e+13"="Low",
+                                "1.5e+14"="High"), levels = c("0","Low","High"))
+tox$SEVERITY <- as.character(tox$SEVERITY)
+tox$severity <- factor(dplyr::recode(tox$SEVERITY,
+                                     "minimal"="1",
+                                     "mild"="2", 
+                                     "moderate"="3",
+                                     "marked"="4"))
+
+tox$Tissue2 <- factor(dplyr::recode(tox$TISSUE,
+                                     "SPINAL CORD"="Sc",
+                                     "DORSAL ROOT GANGLION"="Drg", 
+                                     "moderate"="3",
+                                     "marked"="4"))
+tox$severity <- as.numeric(tox$severity)
+tox$vector <- factor(dplyr::recode(tox$ID,
+                                     "1001"="aCSF",
+                                     "1501"="aCSF", 
+                                     "1502"="aCSF",
+                                     "2001"="V76",
+                                     "2501"="V76", 
+                                     "2502"="V76",
+                                     "3001"="V76", 
+                                     "3002"="V76", 
+                                     "3501"="V76",
+                                     "4001"="V79",
+                                     "4501"="V79", 
+                                     "4502"="V79",
+                                     "5001"="V79",
+                                     "5002"="V79", 
+                                     "5501"="V79",
+                                     "marked"="V79"))
+tox$REGION <- as.character(tox$REGION)
+tox$REGION[which(tox$REGION=="")] <- as.character(tox$TISSUE[which(tox$REGION=="")])
+tox$REGION <- factor(tox$REGION)
+```
+
+```{r, fig.height=4, fig.width=16}
+tox.axonal.degen <- tox[tox$HISTOPATH == "Axonal Degeneration" & tox$vector %in% c("aCSF","V79") & tox$REGION %in% c("CERVICAL","THORACIC","LUMBAR")& tox$TISSUE %in% c("SPINAL CORD"),]
+tox.axonal.degen$REGION <- factor(tox.axonal.degen$REGION, levels = c("CERVICAL","THORACIC","LUMBAR"))
+p <- ggplot(tox.axonal.degen, aes(x = dose, y = severity)) + 
+  geom_boxplot() +
+  geom_dotplot(binaxis='y', 
+               stackdir='center', 
+               dotsize = 1,
+               fill="black") +
+  ylab("Severity score") +
+  ggtitle("Axonal degeneration") +
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) 
+  print(p)
+  # ggsave(filename = paste0("/camhpc/ngs/projects/TST11724/scripts/plots/ratios/",i,".png"), 
+  #        plot = p)
+
+```
+```{r}
+ggplot(data=tox.axonal.degen, aes(x=severity,  fill=dose)) +
+  geom_bar() +
+  facet_grid(~REGION)
+```
+```{r}
+tox.axonal.degen$severity <- factor(tox.axonal.degen$severity)
+ggplot(data=tox.axonal.degen, aes(x=dose,  fill=severity)) +
+  geom_bar() +
+  facet_grid(~REGION)
+```
+```{r, fig.height=3, fig.width=6}
+ggplot(data=tox.axonal.degen, aes(x=severity,  fill=REGION)) +
+  geom_bar() +
+  facet_grid(~dose)
+```
+
+```{r, fig.height=4, fig.width=16}
+mono <- tox[tox$HISTOPATH == "Mononuclear Cell Infiltration" & tox$vector %in% c("aCSF","V79")& tox$REGION %in% c("CERVICAL","THORACIC","LUMBAR"),]
+mono$REGION <- factor(mono$REGION, levels = c("CERVICAL","THORACIC","LUMBAR",""))
+p <- ggplot(mono, aes(x = dose, y = severity)) + 
+  geom_boxplot() +
+  geom_dotplot(binaxis='y', 
+               stackdir='center', 
+               dotsize = 1,
+               fill="black") +
+  ylab("Severity score") +
+  ggtitle("Axonal degeneration") +
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) 
+  print(p)
+  # ggsave(filename = paste0("/camhpc/ngs/projects/TST11724/scripts/plots/ratios/",i,".png"), 
+  #        plot = p)
+
+```
+```{r}
+ggplot(data=mono, aes(x=severity,  fill=dose)) +
+  geom_bar() +
+  facet_grid(~REGION)
+```
+```{r}
+mono$severity <- factor(mono$severity)
+ggplot(data=tox.axonal.degen, aes(x=dose,  fill=severity)) +
+  geom_bar() +
+  facet_grid(~REGION)
+```
+```{r, fig.height=3, fig.width=6}
+ggplot(data=mono, aes(x=severity,  fill=REGION)) +
+  geom_bar() +
+  facet_grid(~dose)
+```
+
+```{r, fig.height=4, fig.width=16}
+degen <- tox[tox$HISTOPATH == "Neural Degeneration/Necrosis" & tox$vector %in% c("aCSF","V79")& tox$REGION %in% c("CERVICAL","THORACIC","LUMBAR"),]
+degen$REGION <- factor(degen$REGION, levels = c("CERVICAL","THORACIC","LUMBAR",""))
+p <- ggplot(degen, aes(x = dose, y = severity)) + 
+  geom_boxplot() +
+  geom_dotplot(binaxis='y', 
+               stackdir='center', 
+               dotsize = 1,
+               fill="black") +
+  ylab("Severity score") +
+  ggtitle("Axonal degeneration") +
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) 
+  print(p)
+  # ggsave(filename = paste0("/camhpc/ngs/projects/TST11724/scripts/plots/ratios/",i,".png"), 
+  #        plot = p)
+
+```
+```{r}
+ggplot(data=degen, aes(x=severity,  fill=dose)) +
+  geom_bar() +
+  facet_grid(~REGION)
+```
+```{r}
+degen$severity <- factor(degen$severity)
+ggplot(data=tox.axonal.degen, aes(x=dose,  fill=severity)) +
+  geom_bar() +
+  facet_grid(~REGION)
+```
+```{r, fig.height=3, fig.width=6}
+ggplot(data=degen, aes(x=severity,  fill=REGION)) +
+  geom_bar() +
+  facet_grid(~dose)
+```
+
+
+# Correlation of sense/antisense WPRE and PolyA with SC Histopath
+
+```{r}
+tox.axonal.degen$severity <- as.numeric(tox.axonal.degen$severity)
+tox.axonal.degen$SampleName <- paste0("S",tox.axonal.degen$ID, "_","Sc",substr(tox.axonal.degen$REGION, 1,1))
+tox.axonal.degen.cumulative <- as.data.frame(unique(tox.axonal.degen$SampleName))
+colnames(tox.axonal.degen.cumulative) <- "SampleName"
+row.names(tox.axonal.degen.cumulative) <- tox.axonal.degen.cumulative$SampleName
+#tox.axonal.degen.cumulative$Cumulative.severity <- NULL
+
+
+tox.axonal.degen$REGION <- as.character(tox.axonal.degen$REGION)
+for (i in unique(tox.axonal.degen$SampleName)) {
+  tox.axonal.degen.cumulative[i,"REGION"]<-unique(as.character(tox.axonal.degen[tox.axonal.degen$SampleName == i,"REGION"]))
+  tox.axonal.degen.cumulative[i,"Cumulative.severity"]<-sum(tox.axonal.degen[tox.axonal.degen$SampleName == i,"severity"])
+  
+}
+```
+
+**SENSE unscaled:**
+```{r}
+SC <- vectorTPM_annot[vectorTPM_annot$Tissue == "SC",]
+SC.tox <- merge(SC, tox.axonal.degen.cumulative, by = "SampleName", all.x = T)
+SC.tox$Cumulative.severity[is.na(SC.tox$Cumulative.severity)] <- 0
+```
+
+```{r}
+SC <- vectorTPM_annot[vectorTPM_annot$Tissue == "SC",]
+mat.sense <- as.matrix(SC[,c(21:32)])
+row.names(mat.sense) <- paste0(SC$NHP_ID,"_",SC$TissueSub)
+metadata <- SC[,c(1:20)]
+row.names(metadata) <- paste0("S",SC$NHP_ID,"_",SC$TissueSub)
+heat <- scale(mat.sense)
+#heat <- mat.sense
+metadata$NHP_ID <- factor(metadata$NHP_ID)
+
+metadata2 <- merge(metadata, tox.axonal.degen.cumulative, by = "row.names",all.x = T)
+rownames(metadata2) <- metadata2$Row.names
+metadata2 <- metadata2[rownames(metadata),]
+rm(metadata)
+metadata2[is.na(metadata2$REGION),"REGION"] <- "LUMBAR"
+metadata2[is.na(metadata2$Cumulative.severity),"Cumulative.severity"] <-0
+ann <- data.frame(
+    Region = metadata2$REGION,
+    Dose = metadata2$Dose,
+    stringsAsFactors = FALSE)
+
+colours <- list(
+    Dose = c('0' = '#C7E9C0', 'Low' = '#74C476', 'High' = '#00441B'))
+
+rowAnn <- HeatmapAnnotation(
+    df = ann,
+    which = 'row',
+    col = colours)
+```
+
+
+```{r}
+barplotRow <- HeatmapAnnotation(
+    Cumulative.severity = row_anno_barplot(
+      metadata2[,"Cumulative.severity"],
+      border = FALSE,
+      gp = gpar(fill = '#CCCCCC'),
+      pch = '.',
+      size = unit(2, 'mm'),
+      axis = TRUE,
+      axis_param = list(
+        gp = gpar(fontsize = 12),
+        side = 'top')),
+      annotation_width = unit(c(2.0), 'cm'),
+      which = 'row')
+
+```
+```{r, fig.height=10, fig.width=8}
+
+ComplexHeatmap::Heatmap(heat,
+                        name = "Sense TPM",
+                        cluster_columns = F,
+                        row_km = 5,
+                        left_annotation = rowAnn,
+                        right_annotation = barplotRow)
+```
+
+
+**ANTISENSE scaled:**
+```{r}
+SC <- vectorTPM_annot[vectorTPM_annot$Tissue == "SC",]
+mat.antisense <- as.matrix(SC[,c(33:44)])
+row.names(mat.antisense) <- paste0("S",SC$NHP_ID,"_",SC$TissueSub,"_",SC$Dose)
+metadata <- SC[,c(1:20)]
+row.names(metadata) <- paste0("S",SC$NHP_ID,"_",SC$TissueSub)
+heat.antisense <- scale(mat.antisense)
+# heat.antisense <- mat.antisense
+metadata$NHP_ID <- factor(metadata$NHP_ID)
+metadata2 <- merge(metadata, tox.axonal.degen.cumulative, by = "row.names",all.x = T)
+rownames(metadata2) <- paste0(metadata2$Row.names,"_",metadata2$Dose)
+metadata2 <- metadata2[rownames(heat.antisense),]
+rm(metadata)
+metadata2[is.na(metadata2$REGION),"REGION"] <- "LUMBAR"
+metadata2[is.na(metadata2$Cumulative.severity),"Cumulative.severity"] <-0
+ann <- data.frame(
+    Region = metadata2$REGION,
+    Dose = metadata2$Dose,
+    stringsAsFactors = FALSE)
+
+colours <- list(
+    Dose = c('0' = '#C7E9C0', 'Low' = '#74C476', 'High' = '#00441B'))
+
+rowAnn <- HeatmapAnnotation(
+    df = ann,
+    which = 'row',
+    col = colours)
+```
+
+
+```{r}
+barplotRow <- HeatmapAnnotation(
+    Cumulative.severity = row_anno_barplot(
+      metadata2[,"Cumulative.severity"],
+      border = FALSE,
+      gp = gpar(fill = '#CCCCCC'),
+      pch = '.',
+      size = unit(2, 'mm'),
+      axis = TRUE,
+      axis_param = list(
+        gp = gpar(fontsize = 12),
+        side = 'top')),
+      annotation_width = unit(c(2.0), 'cm'),
+      which = 'row')
+
+```
+```{r, fig.height=10, fig.width=8}
+
+ComplexHeatmap::Heatmap(heat.antisense,
+                        name = "antisense TPM",
+                        cluster_columns = F,
+                        row_km = 5,
+                        left_annotation = rowAnn,
+                        right_annotation = barplotRow)
+```
+```{r}
+png(filename = "/camhpc/ngs/projects/TST11724/scripts/plots/antisense_heatmap_SC_axonal.png", width = 700, height = 800)
+ComplexHeatmap::Heatmap(heat.antisense,
+                        name = "Antisense TPM-Scaled",
+                        cluster_columns = F,
+                        row_km = 5,
+                        left_annotation = rowAnn,
+                        right_annotation = barplotRow)
+dev.off()
+```
+
+```{r}
+wpre.polyA <- vectorTPM_annot_long[vectorTPM_annot_long$vector_annotation %in% c("SampleName","Tissue","NHP_ID","TissueSub","Dose","polyA_signal","WPRE"),]
+wpre.polyA <- wpre.polyA[wpre.polyA$Tissue %in% c("DrgL","DrgT","DrgC","ScC","ScT","ScL"),]
+
+tox.axonal.degen$Tissue2 <- factor(dplyr::recode(tox.axonal.degen$TISSUE,
+                                     "SPINAL CORD"="Sc",
+                                     "DORSAL ROOT GANGLION"="Drg"))
+tox.axonal.degen$Sub <- factor(dplyr::recode(tox.axonal.degen$REGION,
+                                     "CERVICAL"="C",
+                                     "THORACIC"="T",
+                                     "LUMBAR"="L"))
+tox.axonal.degen$TissueSub <- paste0(tox.axonal.degen$Tissue2,tox.axonal.degen$Sub)
+tox.axonal.degen$SampleName <- paste0(tox.axonal.degen$ID,"-",tox.axonal.degen$TissueSub)
+#tox.axonal.degen.wide <- spread(tox.axonal.degen, SECTION, severity)
+
+tox.axonal.degen.wide <- dcast(tox.axonal.degen, SampleName + dose ~ SECTION, value.var="severity")
+
+tox.axonal.RNA <- merge(tox.axonal.degen, wpre.polyA, by.x = "SampleName", by.y = "SampleName.orig")
+```
+
+# Correlation plots:
+
+Correlation between cargo expression and the histopath are done here in a more direct way.
+
+Cumulative severity scores are calculated for each histopath finding. The cumulative scores were calculated so that the C2, C4, C6 were pooled into Cervical; T2, T4, T6 were pooled into Thoracic and L2, L4, L5/L6 were pooled into Lumbar. 
+
+### DRG - Nerual degeneration and necrosis
+Except for 2 outliers, there is correlation between the sense and antisense cargo expression to the severity scores.
+
+```{r}
+tox.drg <- tox[tox$HISTOPATH == "Neural Degeneration/Necrosis" & 
+                 tox$vector %in% c("aCSF","V79") & 
+                 tox$REGION %in% c("CERVICAL","THORACIC","LUMBAR") & 
+                 tox$Tissue2 %in% c("Drg"),]
+
+tox.axonal.degen$REGION <- factor(tox.axonal.degen$REGION, levels = c("CERVICAL","THORACIC","LUMBAR"))
+
+tox.drg$severity <- as.numeric(tox.drg$severity)
+tox.drg$SampleName <- paste0("S",tox.drg$ID, "_","Drg",substr(tox.drg$REGION, 1,1))
+tox.drg.cumulative <- as.data.frame(unique(tox.drg$SampleName))
+colnames(tox.drg.cumulative) <- "SampleName"
+row.names(tox.drg.cumulative) <- tox.drg.cumulative$SampleName
+#tox.axonal.degen.cumulative$Cumulative.severity <- NULL
+
+tox.drg$REGION <- as.character(tox.drg$REGION)
+for (i in unique(tox.drg$SampleName)) {
+  tox.drg.cumulative[i,"REGION"]<-unique(as.character(tox.drg[tox.drg$SampleName == i,"REGION"]))
+  tox.drg.cumulative[i,"Cumulative.severity"]<-sum(tox.drg[tox.drg$SampleName == i,"severity"])
+  
+}
+```
+
+```{r}
+Drg <- vectorTPM_annot[vectorTPM_annot$Tissue == "DRG",]
+Drg.tox <- merge(Drg, tox.drg.cumulative, by = "SampleName", all.x = T)
+Drg.tox$Cumulative.severity[is.na(Drg.tox$Cumulative.severity)] <- 0
+
+Drg.tox$Cumulative.severity <- factor(Drg.tox$Cumulative.severity)
+Drg.tox$amiR_sense <- rowMeans(subset(Drg.tox, select = c("5_miRE-mirimus_sense",
+                                    "guide_amiRSOD1_sense",
+                                    "miR_30a_loop_sense",
+                                    "passenger_amiRSOD1_sense",
+                                    "3_miRE_sense")), na.rm = TRUE)
+
+Drg.tox$amiR_antisense <- rowMeans(subset(Drg.tox, select = c("5_miRE-mirimus_antisense",
+                                    "guide_amiRSOD1_antisense",
+                                    "miR_30a_loop_antisense",
+                                    "passenger_amiRSOD1_antisense",
+                                    "3_miRE_antisense")), na.rm = TRUE)
+
+Drg.tox$Enh_Prom_sense <- rowMeans(subset(Drg.tox, select = c("enhancer_sense",
+                                    "chicken_b_actin_promoter_sense")), na.rm = TRUE)
+
+Drg.tox$Enh_Prom_antisense <- rowMeans(subset(Drg.tox, select = c("enhancer_antisense",
+                                    "chicken_b_actin_promoter_antisense")), na.rm = TRUE)
+
+vector <- c("5_ITR","Enh_Prom","intron","amiR","WPRE","polyA_signal", "3_ITR")
+```
+
+**SENSE:**
+```{r, fig.height=4, fig.width=3}
+
+for (i in vector) {
+  j = paste0(i,"_sense")
+  p <- ggplot(Drg.tox, aes(x = Cumulative.severity, y = Drg.tox[,j])) + 
+  geom_boxplot() +
+  # geom_dotplot(aes(fill=TissueSub), 
+  #              pch=21) +
+  geom_dotplot(binaxis='y', 
+               stackdir='center', 
+               dotsize = 1,
+               aes(fill=TissueSub)) +
+  ggtitle(i) +
+    ylab("Expression (TPM)")+
+    xlab("Cumulative Severity score")
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) 
+  print(p)
+  ggsave(filename = paste0("/camhpc/ngs/projects/TST11724/scripts/plots/Histopath/DRG-Neuraldegen/"
+                            ,j,".png"), 
+           plot = p)
+}
+
+
+```
+**ANTISENSE:**
+```{r, fig.height=4, fig.width=3}
+
+for (i in vector) {
+  j = paste0(i,"_antisense")
+  p <- ggplot(Drg.tox, aes(x = Cumulative.severity, y = Drg.tox[,j])) + 
+  geom_boxplot() +
+  # geom_dotplot(aes(fill=TissueSub), 
+  #              pch=21) +
+  geom_dotplot(binaxis='y', 
+               stackdir='center', 
+               dotsize = 1,
+               aes(fill=TissueSub)) +
+  ggtitle(i) +
+    ylab("Expression (TPM)")+
+    xlab("Cumulative Severity score")
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) 
+  print(p)
+  ggsave(filename = paste0("/camhpc/ngs/projects/TST11724/scripts/plots/Histopath/DRG-Neuraldegen/"
+                            ,j,".png"), 
+           plot = p)
+}
+
+
+```
+
+
+### DRG - Mononuclear Cell Infiltration
+No real correlation seen here.
+
+```{r}
+mono.drg <- tox[tox$HISTOPATH == "Mononuclear Cell Infiltration" & 
+                 tox$vector %in% c("aCSF","V79") & 
+                 tox$REGION %in% c("CERVICAL","THORACIC","LUMBAR") & 
+                 tox$Tissue2 %in% c("Drg"),]
+
+mono.drg$severity <- as.numeric(mono.drg$severity)
+mono.drg$SampleName <- paste0("S",mono.drg$ID, "_","Drg",substr(mono.drg$REGION, 1,1))
+mono.drg.cumulative <- as.data.frame(unique(mono.drg$SampleName))
+colnames(mono.drg.cumulative) <- "SampleName"
+row.names(mono.drg.cumulative) <- mono.drg.cumulative$SampleName
+#tox.axonal.degen.cumulative$Cumulative.severity <- NULL
+
+mono.drg$REGION <- as.character(mono.drg$REGION)
+for (i in unique(mono.drg$SampleName)) {
+  mono.drg.cumulative[i,"REGION"]<-unique(as.character(mono.drg[mono.drg$SampleName == i,"REGION"]))
+  mono.drg.cumulative[i,"Cumulative.severity"]<-sum(mono.drg[mono.drg$SampleName == i,"severity"])
+  
+}
+```
+
+```{r}
+Drg <- vectorTPM_annot[vectorTPM_annot$Tissue == "DRG",]
+Drg.mono <- merge(Drg, mono.drg.cumulative, by = "SampleName", all.x = T)
+Drg.mono$Cumulative.severity[is.na(Drg.mono$Cumulative.severity)] <- 0
+
+Drg.mono$Cumulative.severity <- factor(Drg.mono$Cumulative.severity)
+Drg.mono$amiR_sense <- rowMeans(subset(Drg.mono, select = c("5_miRE-mirimus_sense",
+                                    "guide_amiRSOD1_sense",
+                                    "miR_30a_loop_sense",
+                                    "passenger_amiRSOD1_sense",
+                                    "3_miRE_sense")), na.rm = TRUE)
+
+Drg.mono$amiR_antisense <- rowMeans(subset(Drg.mono, select = c("5_miRE-mirimus_antisense",
+                                    "guide_amiRSOD1_antisense",
+                                    "miR_30a_loop_antisense",
+                                    "passenger_amiRSOD1_antisense",
+                                    "3_miRE_antisense")), na.rm = TRUE)
+
+Drg.mono$Enh_Prom_sense <- rowMeans(subset(Drg.mono, select = c("enhancer_sense",
+                                    "chicken_b_actin_promoter_sense")), na.rm = TRUE)
+
+Drg.mono$Enh_Prom_antisense <- rowMeans(subset(Drg.mono, select = c("enhancer_antisense",
+                                    "chicken_b_actin_promoter_antisense")), na.rm = TRUE)
+
+vector <- c("5_ITR","Enh_Prom","intron","amiR","WPRE","polyA_signal", "3_ITR")
+```
+
+**SENSE:**
+```{r, fig.height=4, fig.width=3}
+
+for (i in vector) {
+  j = paste0(i,"_sense")
+  p <- ggplot(Drg.mono, aes(x = Cumulative.severity, y = Drg.mono[,j])) + 
+  geom_boxplot() +
+  # geom_dotplot(aes(fill=TissueSub), 
+  #              pch=21) +
+  geom_dotplot(binaxis='y', 
+               stackdir='center', 
+               dotsize = 1,
+               aes(fill=TissueSub)) +
+  ggtitle(i) +
+    ylab("Expression (TPM)")+
+    xlab("Cumulative Severity score")
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) 
+  print(p)
+}
+
+
+```
+
+**ANTISENSE:**
+```{r, fig.height=4, fig.width=3}
+
+for (i in vector) {
+  j = paste0(i,"_antisense")
+  p <- ggplot(Drg.mono, aes(x = Cumulative.severity, y = Drg.mono[,j])) + 
+  geom_boxplot() +
+  # geom_dotplot(aes(fill=TissueSub), 
+  #              pch=21) +
+  geom_dotplot(binaxis='y', 
+               stackdir='center', 
+               dotsize = 1,
+               aes(fill=TissueSub)) +
+  ggtitle(i) +
+    ylab("Expression (TPM)")+
+    xlab("Cumulative Severity score")
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) 
+  print(p)
+}
+
+
+```
+
+### Spinal cord - Axonal Degeneration
+No real correlation seen here.
+
+```{r}
+tox.sc <- tox[tox$HISTOPATH == "Axonal Degeneration" & 
+                 tox$vector %in% c("aCSF","V79") & 
+                 tox$REGION %in% c("CERVICAL","THORACIC","LUMBAR") & 
+                 tox$CAUDA.EQUINA != c("CAUDA.EQUINA") &
+                 tox$Tissue2 %in% c("Sc"),]
+
+tox.axonal.degen$REGION <- factor(tox.axonal.degen$REGION, levels = c("CERVICAL","THORACIC","LUMBAR"))
+
+tox.sc$severity <- as.numeric(tox.sc$severity)
+tox.sc$SampleName <- paste0("S",tox.sc$ID, "_","Sc",substr(tox.sc$REGION, 1,1))
+tox.sc.cumulative <- as.data.frame(unique(tox.sc$SampleName))
+colnames(tox.sc.cumulative) <- "SampleName"
+row.names(tox.sc.cumulative) <- tox.sc.cumulative$SampleName
+#tox.axonal.degen.cumulative$Cumulative.severity <- NULL
+
+tox.sc$REGION <- as.character(tox.sc$REGION)
+for (i in unique(tox.sc$SampleName)) {
+  tox.sc.cumulative[i,"REGION"]<-unique(as.character(tox.sc[tox.sc$SampleName == i,"REGION"]))
+  tox.sc.cumulative[i,"Cumulative.severity"]<-sum(tox.sc[tox.sc$SampleName == i,"severity"])
+  
+}
+```
+
+```{r}
+spinal <- vectorTPM_annot[vectorTPM_annot$Tissue == "SC",]
+sc.tox <- merge(spinal, tox.sc.cumulative, by = "SampleName", all.x = T)
+sc.tox$Cumulative.severity[is.na(sc.tox$Cumulative.severity)] <- 0
+
+sc.tox$Cumulative.severity <- factor(sc.tox$Cumulative.severity)
+sc.tox$amiR_sense <- rowMeans(subset(sc.tox, select = c("5_miRE-mirimus_sense",
+                                    "guide_amiRSOD1_sense",
+                                    "miR_30a_loop_sense",
+                                    "passenger_amiRSOD1_sense",
+                                    "3_miRE_sense")), na.rm = TRUE)
+
+sc.tox$amiR_antisense <- rowMeans(subset(sc.tox, select = c("5_miRE-mirimus_antisense",
+                                    "guide_amiRSOD1_antisense",
+                                    "miR_30a_loop_antisense",
+                                    "passenger_amiRSOD1_antisense",
+                                    "3_miRE_antisense")), na.rm = TRUE)
+
+sc.tox$Enh_Prom_sense <- rowMeans(subset(sc.tox, select = c("enhancer_sense",
+                                    "chicken_b_actin_promoter_sense")), na.rm = TRUE)
+
+sc.tox$Enh_Prom_antisense <- rowMeans(subset(sc.tox, select = c("enhancer_antisense",
+                                    "chicken_b_actin_promoter_antisense")), na.rm = TRUE)
+
+vector <- c("5_ITR","Enh_Prom","intron","amiR","WPRE","polyA_signal", "3_ITR")
+```
+
+**SENSE:**
+```{r, fig.height=4, fig.width=3}
+
+for (i in vector) {
+  j = paste0(i,"_sense")
+  p <- ggplot(sc.tox, aes(x = Cumulative.severity, y = sc.tox[,j])) + 
+  geom_boxplot() +
+  # geom_dotplot(aes(fill=TissueSub), 
+  #              pch=21) +
+  geom_dotplot(binaxis='y', 
+               stackdir='center', 
+               dotsize = 1,
+               aes(fill=TissueSub)) +
+  ggtitle(i) +
+    ylab("Expression (TPM)")+
+    xlab("Cumulative Severity score")
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) 
+  print(p)
+}
+
+
+```
+**ANTISENSE:**
+```{r, fig.height=4, fig.width=3}
+
+for (i in vector) {
+  j = paste0(i,"_antisense")
+  p <- ggplot(sc.tox, aes(x = Cumulative.severity, y = sc.tox[,j])) + 
+  geom_boxplot() +
+  # geom_dotplot(aes(fill=TissueSub), 
+  #              pch=21) +
+  geom_dotplot(binaxis='y', 
+               stackdir='center', 
+               dotsize = 1,
+               aes(fill=TissueSub)) +
+  ggtitle(i) +
+    ylab("Expression (TPM)")+
+    xlab("Cumulative Severity score")
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) 
+  print(p)
+}
+
+
+```
+
+### Spinal cord - Neural Degeneration/Necrosis
+No real correlation seen here.
+
+```{r}
+degen.sc <- tox[tox$HISTOPATH == "Neural Degeneration/Necrosis" & 
+                 tox$vector %in% c("aCSF","V79") & 
+                 tox$REGION %in% c("CERVICAL","THORACIC","LUMBAR") & 
+                 tox$CAUDA.EQUINA != c("CAUDA.EQUINA") &
+                 tox$Tissue2 %in% c("Sc"),]
+
+degen.sc$severity <- as.numeric(degen.sc$severity)
+degen.sc$SampleName <- paste0("S",degen.sc$ID, "_","Sc",substr(degen.sc$REGION, 1,1))
+degen.sc.cumulative <- as.data.frame(unique(degen.sc$SampleName))
+colnames(degen.sc.cumulative) <- "SampleName"
+row.names(degen.sc.cumulative) <- degen.sc.cumulative$SampleName
+#tox.axonal.degen.cumulative$Cumulative.severity <- NULL
+
+degen.sc$REGION <- as.character(degen.sc$REGION)
+for (i in unique(degen.sc$SampleName)) {
+  degen.sc.cumulative[i,"REGION"]<-unique(as.character(degen.sc[degen.sc$SampleName == i,"REGION"]))
+  degen.sc.cumulative[i,"Cumulative.severity"]<-sum(degen.sc[degen.sc$SampleName == i,"severity"])
+  
+}
+```
+
+```{r}
+spinal <- vectorTPM_annot[vectorTPM_annot$Tissue == "SC",]
+sc.degen <- merge(spinal, degen.sc.cumulative, by = "SampleName", all.x = T)
+sc.degen$Cumulative.severity[is.na(sc.degen$Cumulative.severity)] <- 0
+
+sc.degen$Cumulative.severity <- factor(sc.degen$Cumulative.severity)
+sc.degen$amiR_sense <- rowMeans(subset(sc.degen, select = c("5_miRE-mirimus_sense",
+                                    "guide_amiRSOD1_sense",
+                                    "miR_30a_loop_sense",
+                                    "passenger_amiRSOD1_sense",
+                                    "3_miRE_sense")), na.rm = TRUE)
+
+sc.degen$amiR_antisense <- rowMeans(subset(sc.degen, select = c("5_miRE-mirimus_antisense",
+                                    "guide_amiRSOD1_antisense",
+                                    "miR_30a_loop_antisense",
+                                    "passenger_amiRSOD1_antisense",
+                                    "3_miRE_antisense")), na.rm = TRUE)
+
+sc.degen$Enh_Prom_sense <- rowMeans(subset(sc.degen, select = c("enhancer_sense",
+                                    "chicken_b_actin_promoter_sense")), na.rm = TRUE)
+
+sc.degen$Enh_Prom_antisense <- rowMeans(subset(sc.degen, select = c("enhancer_antisense",
+                                    "chicken_b_actin_promoter_antisense")), na.rm = TRUE)
+
+vector <- c("5_ITR","Enh_Prom","intron","amiR","WPRE","polyA_signal", "3_ITR")
+```
+
+**SENSE:**
+```{r, fig.height=4, fig.width=3}
+
+for (i in vector) {
+  j = paste0(i,"_sense")
+  p <- ggplot(sc.degen, aes(x = Cumulative.severity, y = sc.degen[,j])) + 
+  geom_boxplot() +
+  # geom_dotplot(aes(fill=TissueSub), 
+  #              pch=21) +
+  geom_dotplot(binaxis='y', 
+               stackdir='center', 
+               dotsize = 1,
+               aes(fill=TissueSub)) +
+  ggtitle(i) +
+    ylab("Expression (TPM)")+
+    xlab("Cumulative Severity score")
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) 
+  print(p)
+}
+
+
+```
+
+**ANTISENSE:**
+```{r, fig.height=4, fig.width=3}
+
+for (i in vector) {
+  j = paste0(i,"_antisense")
+  p <- ggplot(sc.degen, aes(x = Cumulative.severity, y = sc.degen[,j])) + 
+  geom_boxplot() +
+  # geom_dotplot(aes(fill=TissueSub), 
+  #              pch=21) +
+  geom_dotplot(binaxis='y', 
+               stackdir='center', 
+               dotsize = 1,
+               aes(fill=TissueSub)) +
+  ggtitle(i) +
+    ylab("Expression (TPM)")+
+    xlab("Cumulative Severity score")
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) 
+  print(p)
+}
+
+
+```
+
+### Spinal cord - Mononuclear Cell Infiltration
+No real correlation seen here.
+
+```{r}
+mono.sc <- tox[tox$HISTOPATH == "Mononuclear Cell Infiltration" & 
+                 tox$vector %in% c("aCSF","V79") & 
+                 tox$REGION %in% c("CERVICAL","THORACIC","LUMBAR") & 
+                 tox$CAUDA.EQUINA != c("CAUDA.EQUINA") &
+                 tox$Tissue2 %in% c("Sc"),]
+
+mono.sc$severity <- as.numeric(mono.sc$severity)
+mono.sc$SampleName <- paste0("S",mono.sc$ID, "_","Sc",substr(mono.sc$REGION, 1,1))
+mono.sc.cumulative <- as.data.frame(unique(mono.sc$SampleName))
+colnames(mono.sc.cumulative) <- "SampleName"
+row.names(mono.sc.cumulative) <- mono.sc.cumulative$SampleName
+#tox.axonal.degen.cumulative$Cumulative.severity <- NULL
+
+mono.sc$REGION <- as.character(mono.sc$REGION)
+for (i in unique(mono.sc$SampleName)) {
+  mono.sc.cumulative[i,"REGION"]<-unique(as.character(mono.sc[mono.sc$SampleName == i,"REGION"]))
+  mono.sc.cumulative[i,"Cumulative.severity"]<-sum(mono.sc[mono.sc$SampleName == i,"severity"])
+  
+}
+```
+
+```{r}
+spinal <- vectorTPM_annot[vectorTPM_annot$Tissue == "SC",]
+sc.tox <- merge(spinal, mono.sc.cumulative, by = "SampleName", all.x = T)
+sc.tox$Cumulative.severity[is.na(sc.tox$Cumulative.severity)] <- 0
+
+sc.tox$Cumulative.severity <- factor(sc.tox$Cumulative.severity)
+sc.tox$amiR_sense <- rowMeans(subset(sc.tox, select = c("5_miRE-mirimus_sense",
+                                    "guide_amiRSOD1_sense",
+                                    "miR_30a_loop_sense",
+                                    "passenger_amiRSOD1_sense",
+                                    "3_miRE_sense")), na.rm = TRUE)
+
+sc.tox$amiR_antisense <- rowMeans(subset(sc.tox, select = c("5_miRE-mirimus_antisense",
+                                    "guide_amiRSOD1_antisense",
+                                    "miR_30a_loop_antisense",
+                                    "passenger_amiRSOD1_antisense",
+                                    "3_miRE_antisense")), na.rm = TRUE)
+
+sc.tox$Enh_Prom_sense <- rowMeans(subset(sc.tox, select = c("enhancer_sense",
+                                    "chicken_b_actin_promoter_sense")), na.rm = TRUE)
+
+sc.tox$Enh_Prom_antisense <- rowMeans(subset(sc.tox, select = c("enhancer_antisense",
+                                    "chicken_b_actin_promoter_antisense")), na.rm = TRUE)
+
+vector <- c("5_ITR","Enh_Prom","intron","amiR","WPRE","polyA_signal", "3_ITR")
+```
+
+**SENSE:**
+```{r, fig.height=4, fig.width=3}
+
+for (i in vector) {
+  j = paste0(i,"_sense")
+  p <- ggplot(sc.tox, aes(x = Cumulative.severity, y = sc.tox[,j])) + 
+  geom_boxplot() +
+  # geom_dotplot(aes(fill=TissueSub), 
+  #              pch=21) +
+  geom_dotplot(binaxis='y', 
+               stackdir='center', 
+               dotsize = 1,
+               aes(fill=TissueSub)) +
+  ggtitle(i) +
+    ylab("Expression (TPM)")+
+    xlab("Cumulative Severity score")
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) 
+  print(p)
+}
+
+
+```
+
+**ANTISENSE:**
+```{r, fig.height=4, fig.width=3}
+
+for (i in vector) {
+  j = paste0(i,"_antisense")
+  p <- ggplot(sc.tox, aes(x = Cumulative.severity, y = sc.tox[,j])) + 
+  geom_boxplot() +
+  # geom_dotplot(aes(fill=TissueSub), 
+  #              pch=21) +
+  geom_dotplot(binaxis='y', 
+               stackdir='center', 
+               dotsize = 1,
+               aes(fill=TissueSub)) +
+  ggtitle(i) +
+    ylab("Expression (TPM)")+
+    xlab("Cumulative Severity score")
+  theme(axis.text.x = element_text(angle = 45, hjust=0.5), plot.title = element_text(hjust = 0.5)) 
+  print(p)
+}
+
+
+```

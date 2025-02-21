@@ -1,0 +1,47 @@
+---
+title: "TST11887: Combining all summary statistics of cellranger outputs"
+author: "Soumya Negi, Genome Informatics"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    code_folding: hide
+    collapsed: no
+    highlight: haddock
+    theme: journal
+    toc: yes
+    toc_float:
+      collapsed: no
+    fig_width: 9
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T,  message=FALSE, warning=FALSE, cache=FALSE)
+library(ggplot2)
+library(cowplot)
+library(dplyr)
+library(tidyverse)
+library(RColorBrewer)
+library(data.table)
+library(tidyverse)
+```
+
+# Background
+
+```{r}
+samplesheet <- read.table("/camhpc/ngs/projects/TST11887/scripts/TST11887_Samples.csv", header = T, sep = ",")
+samplesheet$Sample.Name <- as.character(samplesheet$Sample.Name)
+
+path <- file.path("/camhpc/ngs/projects/TST11887/DNANexus/20220325113054/",samplesheet$Sample.Name[!samplesheet$Sample.Name %in% c("empty1","empty2","empty3")],".metrics_summary.csv", fsep = "")
+
+all.files <- as.data.frame(path %>% 
+  lapply(read_csv) %>%                                           
+  bind_rows)   
+
+all.files$SampleName <- samplesheet$Sample.Name[!samplesheet$Sample.Name %in% c("empty1","empty2","empty3")]
+all.files$SampleName2 <- samplesheet$Sample.Name[!samplesheet$Sample.Name %in% c("empty1","empty2","empty3")]
+all.files <- all.files %>% separate(SampleName2, c('Species', 'Number','Tissue'))
+all.files <- c(all.files[,20:23],all.files[,1:19])
+
+write.table(all.files, file = "cellranger_summary_statistics.txt", quote = F, sep = "\t",row.names = F, col.names = T)
+
+```
